@@ -1,8 +1,8 @@
 # Privacy Policy — GW2 Roster Bot
 
-**Last updated:** [DATE]
+**Last updated:** [2026/06/17]
 
-This Privacy Policy explains what information the GW2 Roster Bot ("the Bot") collects, how it is used, and how it is stored when the Bot is added to a Discord server.
+This Privacy Policy explains what information the GW2 Roster Bot collects, how it is used, and how it is stored when the Bot is added to a Discord server.
 
 ## 1. Information We Collect
 

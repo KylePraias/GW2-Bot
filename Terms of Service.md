@@ -1,8 +1,8 @@
 # Terms of Service — GW2 Roster Bot
 
-**Last updated:** [DATE]
+**Last updated:** [2026/06/17]
 
-These Terms of Service ("Terms") govern your use of the GW2 Roster Bot ("the Bot") on Discord. By adding the Bot to a server or using any of its commands, you agree to these Terms. If you do not agree, do not add or use the Bot.
+These Terms of Service ("Terms") govern your use of the GW2 Roster Bot on Discord. By adding the Bot to a server or using any of its commands, you agree to these Terms. If you do not agree, do not add or use the Bot.
 
 ## 1. Description of Service
 
