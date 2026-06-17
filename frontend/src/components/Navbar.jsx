@@ -9,6 +9,7 @@ const LINKS = [
   { to: "/how-to-add", label: "How to Add" },
   { to: "/features", label: "Features" },
   { to: "/commands", label: "Commands" },
+  { to: "/faq", label: "FAQ" },
 ];
 
 export default function Navbar() {

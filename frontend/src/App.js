@@ -7,6 +7,7 @@ import Home from "./pages/Home";
 import HowToAdd from "./pages/HowToAdd";
 import Features from "./pages/Features";
 import Commands from "./pages/Commands";
+import Faq from "./pages/Faq";
 
 function ScrollToTop() {
   const { pathname } = useLocation();
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="/how-to-add" element={<HowToAdd />} />
           <Route path="/features" element={<Features />} />
           <Route path="/commands" element={<Commands />} />
+          <Route path="/faq" element={<Faq />} />
         </Routes>
       </main>
       <Footer />

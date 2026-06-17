@@ -61,6 +61,9 @@ export default function Footer() {
             <Link to="/commands" className="hover:text-amber-500 transition-colors">
               Commands
             </Link>
+            <Link to="/faq" className="hover:text-amber-500 transition-colors">
+              FAQ
+            </Link>
           </nav>
           <p>
             Not affiliated with ArenaNet. Guild Wars 2 is a trademark of
