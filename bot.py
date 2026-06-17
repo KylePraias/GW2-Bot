@@ -751,7 +751,7 @@ async def on_message(message: discord.Message):
 # /setup
 # ---------------------------------------------------------------------------
 
-@tree.command(name="setup", description="[Admin] Configure the GW2 roster bot.")
+@tree.command(name="setup", description="Configure the GW2 roster bot (admin only).")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     api_key      = "Your GW2 API key (guilds permission, must be guild leader)",
@@ -870,7 +870,10 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
     gw2_username = gw2_username.strip()
 
     if gw2_username in verified:
-        await interaction.followup.send("❌ That GW2 account is already linked to another Discord user.", ephemeral=True)
+        if verified[gw2_username] == interaction.user.id:
+            await interaction.followup.send(f"❌ **{gw2_username}** is already linked to your account.", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ That GW2 account is already linked to another Discord user.", ephemeral=True)
         return
 
     try:
@@ -951,10 +954,16 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
 
     # Check if the GW2 account is already linked to someone else
     if gw2_username in verified:
-        await interaction.followup.send(
-            f"❌ **{gw2_username}** is already linked to another Discord user.",
-            ephemeral=True
-        )
+        if verified[gw2_username] == member.id:
+            await interaction.followup.send(
+                f"❌ **{gw2_username}** is already linked to {member.mention}.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **{gw2_username}** is already linked to another Discord user.",
+                ephemeral=True
+            )
         return
 
     # Check the account is actually in the guild
@@ -1341,8 +1350,8 @@ async def viewreport(interaction: discord.Interaction):
     report_channel = interaction.guild.get_channel(rcfg["report_channel_id"])
 
     await interaction.followup.send(
-        f"**Report system configuration:**\\n"
-        f"• Button posted in: {button_channel.mention if button_channel else 'Unknown channel'}\\n"
+        f"**Report system configuration:**\n"
+        f"• Button posted in: {button_channel.mention if button_channel else 'Unknown channel'}\n"
         f"• Reports sent to: {report_channel.mention if report_channel else 'Unknown channel'}",
         ephemeral=True
     )
@@ -1375,7 +1384,7 @@ async def removereport(interaction: discord.Interaction):
 # /unsetup
 # ---------------------------------------------------------------------------
 
-@tree.command(name="unsetup", description="[Admin]Remove the GW2 roster bot configuration for this server.")
+@tree.command(name="unsetup", description="Remove the GW2 roster bot configuration for this server.")
 @app_commands.default_permissions(administrator=True)
 async def unsetup(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
