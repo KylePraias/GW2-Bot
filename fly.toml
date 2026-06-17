@@ -1,0 +1,22 @@
+# fly.toml app configuration file generated for gw2-roster-bot on 2026-06-07T21:55:34-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'gw2-roster-bot'
+primary_region = 'yyz'
+
+[build]
+
+[processes]
+  app = "python bot.py"
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
+
+[mounts]
+  source = "gw2_data"
+  destination = "/data"
