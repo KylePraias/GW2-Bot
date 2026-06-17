@@ -51,6 +51,29 @@ def delete_guild_config(guild_id: int):
     save_config(config)
 
 # ---------------------------------------------------------------------------
+# Report system config helpers
+# Stored as a top-level key in config.json:
+# { "reports": { "<discord_guild_id>": {
+#       "button_channel_id": int, "report_channel_id": int,
+#       "button_message_id": int, "setup_by": int
+#   } } }
+# ---------------------------------------------------------------------------
+
+def get_report_config(guild_id: int) -> dict | None:
+    config = load_config()
+    return config.get("reports", {}).get(str(guild_id))
+
+def set_report_config(guild_id: int, data: dict):
+    config = load_config()
+    config.setdefault("reports", {})[str(guild_id)] = data
+    save_config(config)
+
+def delete_report_config(guild_id: int):
+    config = load_config()
+    config.get("reports", {}).pop(str(guild_id), None)
+    save_config(config)
+
+# ---------------------------------------------------------------------------
 # Verified accounts helpers
 # ---------------------------------------------------------------------------
 
@@ -94,6 +117,11 @@ def build_nickname(gw2_names: list[str]) -> str | None:
     if len(nick) > 32:
         nick = nick[:29] + "..."
     return nick
+
+
+def get_role_names(cfg: dict) -> tuple[str, str]:
+    """Returns (member_role_name, guest_role_name), defaulting to 'Member' and 'Guest'."""
+    return cfg.get("member_role_name", "Member"), cfg.get("guest_role_name", "Guest")
 
 # ---------------------------------------------------------------------------
 # Autodelete channel helpers
@@ -451,6 +479,131 @@ class RosterView(discord.ui.View):
         await interaction.followup.send("Here's the current roster:", file=file, ephemeral=True)
 
 # ---------------------------------------------------------------------------
+# Report / feedback system
+# ---------------------------------------------------------------------------
+
+REPORT_CATEGORIES = [
+    ("Member Conduct", "⚠️"),
+    ("Suggestion", "💡"),
+    ("Event Feedback", "🎉"),
+    ("Other", "📝"),
+]
+
+class ReportModal(discord.ui.Modal, title="Submit a Report"):
+    def __init__(self, category: str, anonymous: bool):
+        super().__init__()
+        self.category  = category
+        self.anonymous = anonymous
+
+    message = discord.ui.TextInput(
+        label="Your message",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe your report or feedback here...",
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        rcfg = get_report_config(interaction.guild_id)
+        if not rcfg:
+            await interaction.response.send_message("❌ The report system is not configured for this server.", ephemeral=True)
+            return
+
+        report_channel = interaction.client.get_channel(rcfg["report_channel_id"])
+        if report_channel is None:
+            await interaction.response.send_message("❌ The report channel could not be found. Contact an admin.", ephemeral=True)
+            return
+
+        submitter = "Anonymous" if self.anonymous else interaction.user.display_name
+
+        embed = discord.Embed(
+            title=f"New Report — {self.category}",
+            description=self.message.value,
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Submitted by", value=submitter, inline=True)
+        embed.add_field(name="Category", value=self.category, inline=True)
+
+        try:
+            await report_channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ I don't have permission to post in the report channel.", ephemeral=True)
+            return
+
+        logging.info(
+            f"Report submitted in guild {interaction.guild_id} — category={self.category}, "
+            f"anonymous={self.anonymous}, by={interaction.user.id}"
+        )
+        await interaction.response.send_message("✅ Your report has been submitted. Thank you!", ephemeral=True)
+
+
+class ReportCategorySelect(discord.ui.Select):
+    def __init__(self, anonymous: bool):
+        self.anonymous = anonymous
+        options = [
+            discord.SelectOption(label=name, emoji=emoji)
+            for name, emoji in REPORT_CATEGORIES
+        ]
+        super().__init__(placeholder="Choose a category...", options=options, custom_id="report_category_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        category = self.values[0]
+        await interaction.response.send_modal(ReportModal(category=category, anonymous=self.anonymous))
+
+
+class ReportCategoryView(discord.ui.View):
+    """Ephemeral, short-lived view shown after the user picks anonymous/named."""
+    def __init__(self, anonymous: bool):
+        super().__init__(timeout=180)
+        self.add_item(ReportCategorySelect(anonymous=anonymous))
+
+
+class ReportView(discord.ui.View):
+    """Persistent view attached to the report button message."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Submit a Report",
+        style=discord.ButtonStyle.primary,
+        emoji="📨",
+        custom_id="open_report_form",
+    )
+    async def open_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rcfg = get_report_config(interaction.guild_id)
+        if not rcfg:
+            await interaction.response.send_message("❌ The report system is not configured for this server.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            "Would you like to include your server nickname, or remain anonymous?",
+            view=AnonymityChoiceView(),
+            ephemeral=True
+        )
+
+
+class AnonymityChoiceView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Use my nickname", style=discord.ButtonStyle.secondary, emoji="🙋")
+    async def named(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose a category for your report:",
+            view=ReportCategoryView(anonymous=False),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Stay anonymous", style=discord.ButtonStyle.secondary, emoji="🕶️")
+    async def anonymous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "Choose a category for your report:",
+            view=ReportCategoryView(anonymous=True),
+            ephemeral=True
+        )
+
+# ---------------------------------------------------------------------------
 # Post or edit roster message
 # ---------------------------------------------------------------------------
 
@@ -557,6 +710,7 @@ tree = app_commands.CommandTree(bot)
 @bot.event
 async def on_ready():
     bot.add_view(RosterView())
+    bot.add_view(ReportView())
     await tree.sync()
     logging.info(f"Logged in as {bot.user} ({bot.user.id})")
     if not roster_loop.is_running():
@@ -603,8 +757,17 @@ async def on_message(message: discord.Message):
     api_key      = "Your GW2 API key (guilds permission, must be guild leader)",
     gw2_guild_id = "Your GW2 Guild ID (UUID)",
     channel      = "Channel to post the daily roster in",
+    member_role  = "Role to grant on verification (default: role named 'Member')",
+    guest_role   = "Role to remove on verification (default: role named 'Guest')",
 )
-async def setup(interaction: discord.Interaction, api_key: str, gw2_guild_id: str, channel: discord.TextChannel):
+async def setup(
+    interaction: discord.Interaction,
+    api_key: str,
+    gw2_guild_id: str,
+    channel: discord.TextChannel,
+    member_role: discord.Role | None = None,
+    guest_role: discord.Role | None = None,
+):
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -624,12 +787,44 @@ async def setup(interaction: discord.Interaction, api_key: str, gw2_guild_id: st
     existing_cfg     = get_guild_config(interaction.guild_id)
     existing_verified = existing_cfg.get("verified", {}) if existing_cfg else {}
 
+    # Preserve existing role names if not specified this time, otherwise default to "Member"/"Guest"
+    existing_member_name = existing_cfg.get("member_role_name", "Member") if existing_cfg else "Member"
+    existing_guest_name  = existing_cfg.get("guest_role_name", "Guest") if existing_cfg else "Guest"
+
+    member_role_name = member_role.name if member_role else existing_member_name
+    guest_role_name  = guest_role.name if guest_role else existing_guest_name
+
+    # Verify the Member role actually exists on this server before saving.
+    # Guest role is optional in general usage, but if a name is set (explicitly
+    # or via default), it must exist too — otherwise fail loudly now rather
+    # than silently later.
+    resolved_member_role = member_role or discord.utils.get(interaction.guild.roles, name=member_role_name)
+    resolved_guest_role  = guest_role or discord.utils.get(interaction.guild.roles, name=guest_role_name)
+
+    if not resolved_member_role:
+        await interaction.followup.send(
+            f"❌ Setup failed: no role named **{member_role_name}** exists on this server. "
+            f"Create the role first, or pick an existing one with the `member_role` option.",
+            ephemeral=True
+        )
+        return
+
+    if not resolved_guest_role:
+        await interaction.followup.send(
+            f"❌ Setup failed: no role named **{guest_role_name}** exists on this server. "
+            f"Create the role first, or pick an existing one with the `guest_role` option.",
+            ephemeral=True
+        )
+        return
+
     cfg = {
-        "api_key":      api_key,
-        "gw2_guild_id": gw2_guild_id,
-        "channel_id":   channel.id,
-        "setup_by":     interaction.user.id,
-        "verified":     existing_verified,
+        "api_key":          api_key,
+        "gw2_guild_id":     gw2_guild_id,
+        "channel_id":       channel.id,
+        "setup_by":         interaction.user.id,
+        "verified":         existing_verified,
+        "member_role_name": member_role_name,
+        "guest_role_name":  guest_role_name,
     }
     set_guild_config(interaction.guild_id, cfg)
 
@@ -643,6 +838,7 @@ async def setup(interaction: discord.Interaction, api_key: str, gw2_guild_id: st
     await interaction.followup.send(
         f"✅ Done! **{gw2_name}** roster ({len(members)} members) posted in {channel.mention}.\n"
         f"Updates every hour on the hour. Members can use `/verify` to link their GW2 account.\n"
+        f"Verification grants the **{member_role_name}** role and removes **{guest_role_name}**.\n"
         f"Use `/unsetup` to remove this configuration.",
         ephemeral=True
     )
@@ -662,11 +858,12 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
         return
 
     discord_guild = interaction.guild
-    member_role = discord.utils.get(discord_guild.roles, name="Member")
-    guest_role  = discord.utils.get(discord_guild.roles, name="Guest")
+    member_role_name, guest_role_name = get_role_names(cfg)
+    member_role = discord.utils.get(discord_guild.roles, name=member_role_name)
+    guest_role  = discord.utils.get(discord_guild.roles, name=guest_role_name)
 
     if not member_role:
-        await interaction.followup.send("❌ Could not find a role named **Member** on this server. Ask an admin to create it.", ephemeral=True)
+        await interaction.followup.send(f"❌ Could not find a role named **{member_role_name}** on this server. Ask an admin to create it.", ephemeral=True)
         return
 
     verified = get_verified(interaction.guild_id)
@@ -717,7 +914,7 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
     logging.info(f"Verified {gw2_username} as Discord user {interaction.user.id}")
 
     await interaction.followup.send(
-        f"✅ Verified! Welcome, **{gw2_username}**. You've been given the **Member** role "
+        f"✅ Verified! Welcome, **{gw2_username}**. You've been given the **{member_role_name}** role "
         f"and your server nickname has been updated.",
         ephemeral=True
     )
@@ -741,11 +938,12 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
         return
 
     discord_guild = interaction.guild
-    member_role = discord.utils.get(discord_guild.roles, name="Member")
-    guest_role  = discord.utils.get(discord_guild.roles, name="Guest")
+    member_role_name, guest_role_name = get_role_names(cfg)
+    member_role = discord.utils.get(discord_guild.roles, name=member_role_name)
+    guest_role  = discord.utils.get(discord_guild.roles, name=guest_role_name)
 
     if not member_role:
-        await interaction.followup.send("❌ Could not find a role named **Member** on this server.", ephemeral=True)
+        await interaction.followup.send(f"❌ Could not find a role named **{member_role_name}** on this server.", ephemeral=True)
         return
 
     verified = get_verified(interaction.guild_id)
@@ -810,7 +1008,7 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
     logging.info(f"Admin {interaction.user.id} force-verified {gw2_username} as Discord user {member.id}")
 
     await interaction.followup.send(
-        f"✅ {member.mention} has been verified as **{gw2_username}** and given the **Member** role.",
+        f"✅ {member.mention} has been verified as **{gw2_username}** and given the **{member_role_name}** role.",
         ephemeral=True
     )
 
@@ -823,7 +1021,9 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
 @app_commands.describe(name="Start typing an item name to search")
 async def item_search(interaction: discord.Interaction, name: str):
     # Check guest role before deferring so ephemeral state is set correctly
-    guest_role = discord.utils.get(interaction.guild.roles, name="Guest")
+    item_cfg = get_guild_config(interaction.guild_id)
+    _, guest_role_name = get_role_names(item_cfg) if item_cfg else (None, "Guest")
+    guest_role = discord.utils.get(interaction.guild.roles, name=guest_role_name)
     if guest_role and guest_role in interaction.user.roles:
         await interaction.response.send_message(
             "❌ You need to verify your GW2 account first. Use `/verify` to get access.",
@@ -967,8 +1167,7 @@ async def unlinkall(interaction: discord.Interaction, member: discord.Member):
     logging.info(f"Admin {interaction.user.id} unlinked all accounts from Discord user {member.id}: {gw2_names}")
     names_list = ", ".join(f"**{n}**" for n in gw2_names)
     await interaction.followup.send(
-        f"✅ Unlinked {len(gw2_names)} account(s) from {member.mention}: {names_list}. "
-        f"Their **Member** role has been removed.",
+        f"✅ Unlinked {len(gw2_names)} account(s) from {member.mention}: {names_list}. ",
         ephemeral=True
     )
 
@@ -1022,10 +1221,10 @@ async def viewaccounts(interaction: discord.Interaction, member: discord.Member)
 # /addautodelete  /viewautodelete  /removeautodelete
 # ---------------------------------------------------------------------------
 
-@tree.command(name="addautodelete", description="[Admin] Add a channel to the auto-delete list (bot commands only).")
+@tree.command(name="setupautodelete", description="[Admin] Add a channel to the auto-delete list (bot commands only).")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="The channel to restrict to bot commands only")
-async def addautodelete(interaction: discord.Interaction, channel: discord.TextChannel):
+async def setupautodelete(interaction: discord.Interaction, channel: discord.TextChannel):
     await interaction.response.defer(ephemeral=True)
 
     channels = get_autodelete_channels(interaction.guild_id)
@@ -1089,10 +1288,95 @@ async def removeautodelete(interaction: discord.Interaction, channel: discord.Te
 
 
 # ---------------------------------------------------------------------------
+# /setupreport  /viewreport  /removereport
+# ---------------------------------------------------------------------------
+
+@tree.command(name="setupreport", description="[Admin] Set up the report/feedback button system.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    button_channel = "Channel where the report button message will be posted",
+    report_channel = "Channel where submitted reports will be sent",
+)
+async def setupreport(interaction: discord.Interaction, button_channel: discord.TextChannel, report_channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        title="📨 Submit a Report or Feedback",
+        description="Click the button below to submit a report, suggestion, or feedback. "
+                    "You'll be able to choose a category and whether to stay anonymous.",
+        color=0x5865F2,
+    )
+
+    try:
+        msg = await button_channel.send(embed=embed, view=ReportView())
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ I don't have permission to send messages in {button_channel.mention}.", ephemeral=True)
+        return
+
+    set_report_config(interaction.guild_id, {
+        "button_channel_id": button_channel.id,
+        "report_channel_id": report_channel.id,
+        "button_message_id": msg.id,
+        "setup_by":           interaction.user.id,
+    })
+
+    logging.info(f"Admin {interaction.user.id} set up reports in guild {interaction.guild_id}")
+    await interaction.followup.send(
+        f"✅ Report system set up. Button posted in {button_channel.mention}, "
+        f"reports will be sent to {report_channel.mention}.",
+        ephemeral=True
+    )
+
+
+@tree.command(name="viewreport", description="[Admin] View the current report system configuration.")
+@app_commands.default_permissions(administrator=True)
+async def viewreport(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    rcfg = get_report_config(interaction.guild_id)
+    if not rcfg:
+        await interaction.followup.send("The report system is not set up for this server.", ephemeral=True)
+        return
+
+    button_channel = interaction.guild.get_channel(rcfg["button_channel_id"])
+    report_channel = interaction.guild.get_channel(rcfg["report_channel_id"])
+
+    await interaction.followup.send(
+        f"**Report system configuration:**\\n"
+        f"• Button posted in: {button_channel.mention if button_channel else 'Unknown channel'}\\n"
+        f"• Reports sent to: {report_channel.mention if report_channel else 'Unknown channel'}",
+        ephemeral=True
+    )
+
+
+@tree.command(name="removereport", description="[Admin] Remove the report system entirely.")
+@app_commands.default_permissions(administrator=True)
+async def removereport(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    rcfg = get_report_config(interaction.guild_id)
+    if not rcfg:
+        await interaction.followup.send("The report system is not set up for this server.", ephemeral=True)
+        return
+
+    button_channel = interaction.guild.get_channel(rcfg["button_channel_id"])
+    if button_channel:
+        try:
+            msg = await button_channel.fetch_message(rcfg["button_message_id"])
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+
+    delete_report_config(interaction.guild_id)
+    logging.info(f"Admin {interaction.user.id} removed the report system in guild {interaction.guild_id}")
+    await interaction.followup.send("✅ Report system removed.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
 # /unsetup
 # ---------------------------------------------------------------------------
 
-@tree.command(name="unsetup", description="[Admin] Remove the GW2 roster bot configuration for this server.")
+@tree.command(name="unsetup", description="[Admin]Remove the GW2 roster bot configuration for this server.")
 @app_commands.default_permissions(administrator=True)
 async def unsetup(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
