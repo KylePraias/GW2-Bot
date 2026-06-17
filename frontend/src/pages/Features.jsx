@@ -41,13 +41,6 @@ export default function Features() {
         </div>
 
         <div className="my-24 flex flex-col items-center gap-6 text-center">
-          <h3 className="font-display font-bold text-3xl sm:text-4xl text-stone-100">
-            All of this, free and self-hostable
-          </h3>
-          <p className="text-stone-400 font-light max-w-xl">
-            The bot is open source and stores its config on a persistent volume,
-            so your data survives every redeploy.
-          </p>
           <AddBotButton testId="features-add-bot-btn" />
         </div>
       </section>
