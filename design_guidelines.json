@@ -1,0 +1,151 @@
+{
+  "identity": "E1",
+  "project_context": {
+    "domain": "Discord Bot Marketing Site",
+    "bot_name": "GW2 Roster Bot",
+    "theme": "Dark",
+    "archetype": "5 (Luxury / Cinematic / Moody) infused with Dark Fantasy Gaming",
+    "discord_invite_url": "https://discord.com/oauth2/authorize?client_id=1513337321284702430&permissions=402761728&integration_type=0&scope=bot+applications.commands",
+    "github_url": "https://github.com/KylePraias/GW2-Bot",
+    "visual_style": "Dark, Guild Wars 2-inspired (deep reds/golds, fantasy feel, parchment accents)."
+  },
+  "typography": {
+    "primary_heading": {
+      "family": "Cormorant Garamond, serif",
+      "weight": "font-bold",
+      "tracking": "tracking-tight",
+      "usage": "Hero headers, major section titles. Gives an epic lore and fantasy feeling."
+    },
+    "secondary_heading": {
+      "family": "Cinzel, serif",
+      "weight": "font-bold",
+      "tracking": "tracking-widest",
+      "usage": "Overlines, labels, small caps text, button text."
+    },
+    "body": {
+      "family": "Outfit, sans-serif",
+      "weight": "font-light",
+      "line_height": "leading-relaxed",
+      "usage": "Paragraphs, feature descriptions, UI text. Maintains modern readability."
+    },
+    "monospace": {
+      "family": "JetBrains Mono, monospace",
+      "usage": "Command syntax, code blocks, copy-to-clipboard text."
+    }
+  },
+  "color_palette": {
+    "background": {
+      "base": "bg-stone-950",
+      "surface": "bg-stone-900/80",
+      "surface_elevated": "bg-stone-800/90"
+    },
+    "brand": {
+      "primary": "bg-red-900",
+      "primary_hover": "bg-red-800",
+      "accent_gold": "text-amber-500",
+      "border_gold": "border-amber-500/30",
+      "border_glow": "border-red-900/50"
+    },
+    "text": {
+      "primary": "text-stone-100",
+      "secondary": "text-stone-400",
+      "muted": "text-stone-500",
+      "inverse": "text-black"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "Generous spacing, optical alignment, layered cinematic textures.",
+    "container": "max-w-7xl mx-auto px-6 lg:px-8",
+    "section_gap": "py-24 lg:py-32",
+    "grid_features": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8"
+  },
+  "components": {
+    "hero": {
+      "layout": "Min 80vh, center-aligned content, layered background with heavy red smoke/landscape overlay.",
+      "overlay": "bg-gradient-to-b from-black/70 via-stone-950/80 to-stone-950",
+      "buttons": "Primary ('Add to Discord'): Red-900 background with amber-100 text, soft red glow. Secondary ('Copy URL'): Transparent with amber-500 border and text. MUST have data-testid."
+    },
+    "navbar": {
+      "style": "Crystal Glass variant. bg-stone-950/70 backdrop-blur-xl border-b border-amber-500/10. Sticky top-0 z-50.",
+      "links": "Hover state: text-amber-500 transition-colors duration-300. Active state: text-amber-400 font-bold."
+    },
+    "cards": {
+      "style": "Dark parchment feel. bg-stone-900/60 backdrop-blur-md border border-amber-500/20 hover:border-amber-500/50 transition-all duration-300.",
+      "shadow": "hover:shadow-[0_0_30px_rgba(153,27,27,0.15)]"
+    },
+    "commands_list": {
+      "structure": "Shadcn Tabs (Member vs Admin). Inner content uses Card or Accordion per command.",
+      "styling": "Command name in JetBrains Mono text-amber-500. Description in text-stone-300."
+    },
+    "footer": {
+      "layout": "py-12 border-t border-red-900/30 text-center bg-stone-950",
+      "elements": "GitHub Link, Trademark/Copyright disclaimer."
+    }
+  },
+  "pages_structure": [
+    {
+      "path": "/",
+      "name": "Home",
+      "sections": [
+        "Hero: Title 'GW2 Roster Bot', Subtitle 'Automate your Guild Wars 2 Discord community.', Buttons: Add to Discord & Copy Invite URL",
+        "Quick Features Teaser: 3 small blocks highlighting core value",
+        "CTA to view full guide and features"
+      ]
+    },
+    {
+      "path": "/how-to-add",
+      "name": "How to Add",
+      "sections": [
+        "Step-by-step vertical guide timeline: 1. Click Add to Discord, 2. Authorize Permissions, 3. Run /setup in your server"
+      ]
+    },
+    {
+      "path": "/features",
+      "name": "Features",
+      "sections": [
+        "Bento Grid detailing:",
+        "- Live guild roster auto-updating hourly",
+        "- GW2 account verification with role assignment + auto nickname",
+        "- Multiple account linking",
+        "- Item search with trading post buy/sell prices and autocomplete",
+        "- Channel auto-delete moderation",
+        "- Persistent config"
+      ]
+    },
+    {
+      "path": "/commands",
+      "name": "Commands",
+      "sections": [
+        "Header: Complete Command Reference",
+        "Tabs: Member Commands vs Admin Commands",
+        "Member Commands List: /verify, /item, /viewmyaccounts",
+        "Admin Commands List: /setup, /unsetup, /forceverify, /unlink, /unlinkall, /viewaccounts, /addautodelete, /removeautodelete, /viewautodelete"
+      ]
+    }
+  ],
+  "media_urls": {
+    "hero_background": {
+      "url": "https://images.unsplash.com/photo-1709137405692-374c12e36609?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwyfHxmYW50YXN5JTIwbGFuZHNjYXBlJTIwZGFya3xlbnwwfHx8fDE3ODE2NzIwOTl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Dark fantasy landscape for hero section background"
+    },
+    "red_smoke_overlay": {
+      "url": "https://images.unsplash.com/photo-1652267125724-1aa00ef462b2?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzR8MHwxfHNlYXJjaHwxfHxyZWQlMjBzbW9rZSUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzgxNjcyMTA5fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Red smoke to overlay on top of the hero background for cinematic GW2 feeling"
+    },
+    "texture_gold": {
+      "url": "https://images.pexels.com/photos/6699772/pexels-photo-6699772.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Metallic foil for subtle texture inside cards or feature blocks"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Create a React SPA with react-router-dom containing multiple pages: Home, How to Add, Features, Commands.",
+    "Ensure all interactive elements have data-testid attributes (e.g., data-testid='add-bot-btn', data-testid='copy-invite-btn').",
+    "Implement 'copy to clipboard' functionality using navigator.clipboard.writeText with the exact discord invite URL. Show a success toast using Sonner.",
+    "Use lucide-react for icons (Swords, Shield, Search, Settings, ShieldAlert, etc.).",
+    "Load Google Fonts: 'Cormorant Garamond' (Headings), 'Cinzel' (Subheadings), 'Outfit' (Body), and 'JetBrains Mono' (Commands). Do NOT use generic Inter.",
+    "Build the commands section using Shadcn Tabs to separate 'Member Commands' and 'Admin Commands'.",
+    "Include the GitHub link in the global Footer.",
+    "Use Framer Motion for entrance animations (fade up on scroll, smooth page transitions).",
+    "Ensure high contrast and accessibility while keeping the dark, cinematic Guild Wars 2 theme intact."
+  ]
+}
