@@ -60,15 +60,6 @@ const FAQS = [
     ],
     link: null,
   },
-  {
-    q: "Does my configuration survive restarts and redeploys?",
-    a: [
-      "Yes. All settings, account links and verifications are saved to a persistent volume.",
-      "You only need to run /setup once. To change the channel or key, simply run /setup again.",
-      "Use /unsetup if you ever want to remove the bot's configuration from your server.",
-    ],
-    link: null,
-  },
 ];
 
 function FaqItem({ item, index, open, onToggle }) {
