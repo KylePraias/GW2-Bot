@@ -1302,8 +1302,7 @@ async def setupreport(interaction: discord.Interaction, button_channel: discord.
 
     embed = discord.Embed(
         title="📨 Submit a Report or Feedback",
-        description="Click the button below to submit a report, suggestion, or feedback. "
-                    "You'll be able to choose a category and whether to stay anonymous.",
+        description="Click the button below to submit a report, suggestion, or feedback. ",
         color=0x5865F2,
     )
 
