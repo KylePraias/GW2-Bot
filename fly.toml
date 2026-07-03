@@ -12,10 +12,9 @@ primary_region = 'yyz'
   app = "python bot.py"
 
 [[vm]]
-  memory = '1gb'
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-  memory_mb = 1024
 
 [mounts]
   source = "gw2_data"
