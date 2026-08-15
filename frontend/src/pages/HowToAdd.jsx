@@ -105,9 +105,8 @@ export default function HowToAdd() {
               <span className="text-amber-500">›</span> Your GW2 Guild ID (UUID)
             </li>
             <li className="flex gap-3">
-              <span className="text-amber-500">›</span> A role named{" "}
-              <code className="font-mono text-amber-400">Member</code> in your
-              server
+              <span className="text-amber-500">›</span> A guest role for unverified members (default name:{" "}
+              <code className="font-mono text-amber-400">Guest</code>)
             </li>
           </ul>
           <p className="mt-6 text-stone-500 text-sm font-light">

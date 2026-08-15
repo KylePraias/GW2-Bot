@@ -12,12 +12,12 @@ const TEASERS = [
   {
     icon: Scroll,
     title: "Live Roster",
-    desc: "Your full guild roster, posted and refreshed every hour automatically.",
+    desc: "Your full guild roster, posted and refreshed every 10 minutes automatically.",
   },
   {
     icon: ShieldCheck,
-    title: "Verify Members",
-    desc: "Members link their GW2 account to earn roles and matching nicknames.",
+    title: "Rank Verification",
+    desc: "Members link their GW2 account and receive their exact guild rank role — kept in sync automatically.",
   },
   {
     icon: Search,
@@ -93,7 +93,7 @@ export default function Home() {
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-flicker" />
               Built on the official GW2 API
             </span>
-            <span className="hidden sm:inline">12 slash commands</span>
+            <span className="hidden sm:inline">18 slash commands</span>
           </motion.div>
         </div>
       </section>

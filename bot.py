@@ -13,8 +13,8 @@ logging.basicConfig(level=logging.INFO)
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CONFIG_FILE   = "/data/config.json"
-# Update roster at the top of every hour
-ROSTER_TIMES  = [dt_time(hour=h, minute=0) for h in range(24)]
+# Update roster every 10 minutes (xx:00, xx:10, xx:20, xx:30, xx:40, xx:50)
+ROSTER_TIMES  = [dt_time(hour=h, minute=m) for h in range(24) for m in range(0, 60, 10)]
 
 # In-memory item cache: list of {"id": int, "name": str}
 item_cache: list[dict] = []
@@ -119,9 +119,135 @@ def build_nickname(gw2_names: list[str]) -> str | None:
     return nick
 
 
-def get_role_names(cfg: dict) -> tuple[str, str]:
-    """Returns (member_role_name, guest_role_name), defaulting to 'Member' and 'Guest'."""
-    return cfg.get("member_role_name", "Member"), cfg.get("guest_role_name", "Guest")
+def get_guest_role_name(cfg: dict) -> str:
+    """Returns the guest role name to remove on verification, defaulting to 'Guest'."""
+    return cfg.get("guest_role_name", "Guest")
+
+# ---------------------------------------------------------------------------
+# Guild rank role management
+# ---------------------------------------------------------------------------
+
+# The canonical GW2 guild ranks the bot manages, in hierarchy order (highest first).
+# The bot will ONLY ever create, assign, or remove roles with these exact names.
+# Any other Discord role (pronouns, content, etc.) is never touched.
+GUILD_RANKS = ["Leader", "Officer", "Content Officer", "Founding Member", "Member"]
+
+# Map rank name -> its position index in GUILD_RANKS (0 = highest)
+RANK_PRIORITY: dict[str, int] = {r: i for i, r in enumerate(GUILD_RANKS)}
+
+
+def highest_rank(gw2_names: list[str], members: list[dict]) -> str | None:
+    """
+    Given a list of GW2 account names and the full member list, return the
+    highest guild rank held across all those accounts.  Invited members are
+    excluded.  Returns None if none of the names are full guild members.
+    """
+    rank_by_name = {
+        m["name"]: m["rank"]
+        for m in members
+        if m.get("rank", "").lower() != "invited"
+    }
+    best: str | None = None
+    best_priority = len(GUILD_RANKS)  # lower is better
+    for name in gw2_names:
+        rank = rank_by_name.get(name)
+        if rank and rank in RANK_PRIORITY:
+            p = RANK_PRIORITY[rank]
+            if p < best_priority:
+                best_priority = p
+                best = rank
+    return best
+
+
+async def ensure_rank_role(discord_guild: discord.Guild, rank_name: str) -> discord.Role:
+    """
+    Return the Discord role with the given rank name, creating it if it does
+    not exist.  Newly created roles are positioned so that higher ranks sit
+    above lower ones, directly below the bot's own top role.
+    """
+    role = discord.utils.get(discord_guild.roles, name=rank_name)
+    if role:
+        return role
+
+    # Create the role with no colour (plain)
+    role = await discord_guild.create_role(
+        name=rank_name,
+        reason="GW2 rank role auto-created by roster bot",
+    )
+    logging.info(f"Created rank role '{rank_name}' in guild {discord_guild.id}")
+
+    # Position roles in rank order just below the bot's highest role
+    bot_member   = discord_guild.get_member(discord_guild.me.id)
+    bot_top_pos  = max((r.position for r in bot_member.roles), default=1)
+
+    # Build desired positions: highest rank gets the highest position (just below bot)
+    all_rank_roles = []
+    for r_name in reversed(GUILD_RANKS):   # reversed = lowest rank first
+        r = discord.utils.get(discord_guild.roles, name=r_name)
+        if r:
+            all_rank_roles.append(r)
+
+    # Assign positions starting just above @everyone, up toward the bot
+    base = 1
+    positions = {}
+    for idx, r in enumerate(all_rank_roles):
+        positions[r] = base + idx
+
+    try:
+        await discord_guild.edit_role_positions(positions)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"Could not reorder rank roles in guild {discord_guild.id}: {e}")
+
+    return role
+
+
+async def apply_rank_role(
+    discord_guild: discord.Guild,
+    discord_member: discord.Member,
+    rank_name: str | None,
+    guest_role_name: str,
+):
+    """
+    Ensure discord_member holds exactly the correct rank role and no other
+    guild rank roles.  Also removes the guest role if present.
+
+    - rank_name: the GW2 rank to assign, or None if the member is not in the
+      guild (roles are removed but nothing is added).
+    """
+    guest_role = discord.utils.get(discord_guild.roles, name=guest_role_name)
+
+    # Collect which rank roles the member currently holds
+    current_rank_roles = [r for r in discord_member.roles if r.name in GUILD_RANKS]
+
+    # The target role object (create if needed)
+    target_role = await ensure_rank_role(discord_guild, rank_name) if rank_name else None
+    target_role_id = target_role.id if target_role else None
+
+    roles_to_add    = []
+    roles_to_remove = []
+
+    # Remove all wrong rank roles (compare by ID, not object identity)
+    for r in current_rank_roles:
+        if r.id != target_role_id:
+            roles_to_remove.append(r)
+
+    # Add the correct rank role if not already held (compare by ID)
+    if target_role and not any(r.id == target_role_id for r in discord_member.roles):
+        roles_to_add.append(target_role)
+
+    # Remove guest role if present (compare by ID)
+    if guest_role and any(r.id == guest_role.id for r in discord_member.roles):
+        roles_to_remove.append(guest_role)
+
+    try:
+        if roles_to_remove:
+            await discord_member.remove_roles(*roles_to_remove, reason="GW2 rank sync")
+        if roles_to_add:
+            await discord_member.add_roles(*roles_to_add, reason="GW2 rank sync")
+    except discord.Forbidden:
+        logging.warning(f"Missing permissions to update rank roles for {discord_member.id} in guild {discord_guild.id}")
+    except Exception as e:
+        logging.warning(f"Failed to update rank roles for {discord_member.id}: {e}")
 
 # ---------------------------------------------------------------------------
 # Autodelete channel helpers
@@ -150,6 +276,36 @@ def remove_autodelete_channel(guild_id: int, channel_id: int):
     save_config(config)
 
 # ---------------------------------------------------------------------------
+# Giveaway helpers
+# Stored as a top-level key in config.json:
+# { "giveaways": { "<discord_guild_id>": { "<name>": {
+#       "channel_id": int,
+#       "message_id": int | None,
+#       "min_gold": int,
+#       "created_at": str (ISO 8601 UTC),
+#       "entries": [gw2_name, ...],
+#       "closed": bool
+#   } } } }
+# ---------------------------------------------------------------------------
+
+def get_all_giveaways(guild_id: int) -> dict:
+    config = load_config()
+    return config.get("giveaways", {}).get(str(guild_id), {})
+
+def get_giveaway(guild_id: int, name: str) -> dict | None:
+    return get_all_giveaways(guild_id).get(name)
+
+def save_giveaway(guild_id: int, name: str, data: dict):
+    config = load_config()
+    config.setdefault("giveaways", {}).setdefault(str(guild_id), {})[name] = data
+    save_config(config)
+
+def delete_giveaway(guild_id: int, name: str):
+    config = load_config()
+    config.get("giveaways", {}).get(str(guild_id), {}).pop(name, None)
+    save_config(config)
+
+# ---------------------------------------------------------------------------
 # GW2 API — roster
 # ---------------------------------------------------------------------------
 
@@ -171,6 +327,128 @@ async def fetch_roster(api_key: str, gw2_guild_id: str):
             members = await resp.json()
 
     return guild_data, members
+
+
+async def fetch_guild_log(api_key: str, gw2_guild_id: str) -> list[dict]:
+    """Fetch the guild log from the GW2 API. Returns a list of log entries."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"https://api.guildwars2.com/v2/guild/{gw2_guild_id}/log",
+            headers=headers
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+def build_giveaway_text(name: str, entries: list[str], min_gold: int, created_at: str, closed: bool = False) -> str:
+    """Build the Discord message content for a giveaway entry list."""
+    status = "🔒 CLOSED" if closed else "🎉 Active"
+    lines = [
+        f"**{status} — {name}**",
+        f"Minimum donation: **{min_gold} gold** to the guild bank",
+        f"Started: {created_at}",
+        f"",
+        f"**Entries ({len(entries)})**",
+    ]
+    if entries:
+        for i, gw2_name in enumerate(sorted(entries), 1):
+            lines.append(f"{i}. {gw2_name}")
+    else:
+        lines.append("*No entries yet.*")
+    if not closed:
+        lines.append("")
+        lines.append(f"-# Updates every 10 minutes. Donate at least {min_gold} gold to the guild bank to enter.")
+    return "\n".join(lines)
+
+# ---------------------------------------------------------------------------
+# Join-date and recently-left tracking helpers
+# ---------------------------------------------------------------------------
+
+RECENTLY_LEFT_TTL_HOURS = 24
+
+def fmt_date(dt: datetime) -> str:
+    """Format a datetime as '5 Aug 2026, 14:30 UTC'."""
+    return dt.strftime("%-d %b %Y, %H:%M UTC")
+
+
+def update_member_join_dates(cfg: dict, current_members: list) -> dict:
+    """
+    Compare current API members against stored join_dates.
+    Any member who is now in the guild (rank != "invited") and doesn't yet
+    have a join date gets stamped with the current UTC time.
+    Members who are only "invited" are deliberately excluded.
+    If a member in recently_left reappears as a full member, they are treated
+    as a brand-new join: their recently_left entry is cleared and they receive
+    a fresh join date.
+
+    Returns the updated join_dates dict (also mutates cfg in-place).
+    """
+    join_dates: dict[str, str]     = cfg.setdefault("join_dates", {})
+    recently_left: dict[str, dict] = cfg.setdefault("recently_left", {})
+    now_str = fmt_date(datetime.now(timezone.utc))
+
+    for m in current_members:
+        name = m["name"]
+        rank = m.get("rank", "")
+        if rank.lower() == "invited":
+            continue
+        # Rejoining after leaving — fresh membership, remove from recently left
+        if name in recently_left:
+            recently_left.pop(name)
+            join_dates[name] = now_str
+        elif name not in join_dates:
+            join_dates[name] = now_str
+
+    return join_dates
+
+
+def update_recently_left(cfg: dict, current_members: list) -> dict:
+    """
+    Detect members who were previously tracked (had a join date or were in
+    recently_left) but are no longer present in the API response at all.
+    Records their departure timestamp and prunes entries older than 24 hours.
+
+    Returns the updated recently_left dict (also mutates cfg in-place).
+    Stored format per entry:
+        { "left_at": "2026-08-05 14:30 UTC", "joined_at": "2026-07-01 10:00 UTC" | null }
+    """
+    recently_left: dict[str, dict] = cfg.setdefault("recently_left", {})
+    join_dates: dict[str, str]     = cfg.get("join_dates", {})
+    now_utc = datetime.now(timezone.utc)
+    now_str = fmt_date(now_utc)
+
+    # Names currently visible in the API (any rank, including invited)
+    current_names = {m["name"] for m in current_members}
+
+    # Any name that has a join date but is no longer in the API has left/been kicked
+    for name, joined_at in list(join_dates.items()):
+        if name not in current_names and name not in recently_left:
+            recently_left[name] = {
+                "left_at":  now_str,
+                "joined_at": joined_at,
+            }
+
+    # Prune entries older than 24 hours.
+    # Dates are stored as "5 Aug 2026, 14:30 UTC" — parse with strptime.
+    cutoff = now_utc.timestamp() - RECENTLY_LEFT_TTL_HOURS * 3600
+    for name in list(recently_left.keys()):
+        left_at_str = recently_left[name].get("left_at", "")
+        try:
+            left_dt = datetime.strptime(left_at_str, "%d %b %Y, %H:%M UTC").replace(tzinfo=timezone.utc)
+            if left_dt.timestamp() < cutoff:
+                recently_left.pop(name)
+                join_dates.pop(name, None)
+        except ValueError:
+            pass  # Malformed entry — leave it for next cycle
+
+    # Clean up join_dates entries for people in recently_left so we don't
+    # double-detect them as new leavers on the next cycle
+    for name in recently_left:
+        join_dates.pop(name, None)
+
+    return recently_left
+
 
 # ---------------------------------------------------------------------------
 # GW2 API — item cache (loads in background on startup)
@@ -383,16 +661,35 @@ def item_to_embed(item: dict, prices: dict | None = None) -> discord.Embed:
 # Roster helpers
 # ---------------------------------------------------------------------------
 
-def build_roster_text(guild_data: dict, members: list, verified: dict | None = None) -> tuple[list[str], str]:
+def build_roster_text(
+    guild_data: dict,
+    members: list,
+    verified: dict | None = None,
+    join_dates: dict | None = None,
+    recently_left: dict | None = None,
+) -> tuple[list[str], str]:
     """
     Returns (discord_chunks, plain_text).
     discord_chunks is a list of strings each under 1900 chars, ready to post as separate messages.
     plain_text is the full untruncated roster for download.
+
+    join_dates    — dict mapping gw2_name -> "D Mon YYYY, HH:MM UTC" join timestamp.
+                    Members in the 'invited' rank are shown without a date.
+    recently_left — dict mapping gw2_name -> {"left_at": str, "joined_at": str|None}.
+                    Shown at the bottom of the roster for up to 24 hours.
+
+    Rank display order: Guild Leader → Officer → Content Officer → Member → Invited → Recently Left.
+    Any ranks not in the known order are appended alphabetically after the known ones.
     """
     guild_name     = guild_data.get("name", "Unknown Guild")
     tag            = guild_data.get("tag", "")
-    now            = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now            = fmt_date(datetime.now(timezone.utc))
     verified_names = set(verified.keys()) if verified else set()
+    join_dates     = join_dates or {}
+    recently_left  = recently_left or {}
+
+    # Rank display order — known ranks first, anything else sorted alphabetically after
+    RANK_ORDER = ["Leader", "Officer", "Content Officer", "Founding Member", "Member", "Invited"]
 
     by_rank: dict[str, list] = {}
     for m in members:
@@ -400,31 +697,83 @@ def build_roster_text(guild_data: dict, members: list, verified: dict | None = N
     for rank in by_rank:
         by_rank[rank].sort()
 
-    # Plain text (full, no limit)
+    def sorted_ranks(rank_dict: dict) -> list[str]:
+        known   = [r for r in RANK_ORDER if r in rank_dict]
+        unknown = sorted(r for r in rank_dict if r not in RANK_ORDER)
+        return known + unknown
+
+    # Count only full members (not invited)
+    full_members = [m for m in members if m.get("rank", "").lower() != "invited"]
+    invited      = [m for m in members if m.get("rank", "").lower() == "invited"]
+
+    def plain_join(name: str, is_invited: bool) -> str:
+        if is_invited:
+            return ""
+        date = join_dates.get(name)
+        return f"\n    Joined: {date}" if date else "\n    Joined: Unknown"
+
+    def discord_join(name: str, is_invited: bool) -> str:
+        if is_invited:
+            return ""
+        date = join_dates.get(name)
+        return f"\n    Joined: {date}" if date else "\n    Joined: Unknown"
+
+    # ------------------------------------------------------------------ #
+    # Plain text (full, no limit)                                         #
+    # ------------------------------------------------------------------ #
     plain_lines = [
         f"[{tag}] {guild_name} — Guild Roster",
-        f"Members: {len(members)}",
+        f"Members: {len(full_members)} ({len(invited)} invited)",
         f"Updated: {now}",
         "",
     ]
-    for rank, names in sorted(by_rank.items()):
+    for rank in sorted_ranks(by_rank):
+        names  = by_rank[rank]
+        is_inv = rank.lower() == "invited"
         plain_lines.append(f"== {rank} ({len(names)}) ==")
         for name in names:
-            suffix = " (Verified)" if name in verified_names else ""
-            plain_lines.append(f"  {name}{suffix}")
+            verified_suffix = " (Verified)" if name in verified_names else ""
+            join_suffix     = plain_join(name, is_inv)
+            plain_lines.append(f"  {name}{verified_suffix}{join_suffix}")
         plain_lines.append("")
+
+    if recently_left:
+        plain_lines.append(f"== Recently Left ({len(recently_left)}) ==")
+        for name, info in sorted(recently_left.items()):
+            left_at   = info.get("left_at", "Unknown")
+            joined_at = info.get("joined_at", "Unknown")
+            plain_lines.append(f"  {name}")
+            plain_lines.append(f"    Joined: {joined_at}")
+            plain_lines.append(f"    Left:   {left_at}")
+        plain_lines.append("")
+
     plain_text = "\n".join(plain_lines)
 
-    # Discord lines — split into chunks under 1900 chars
+    # ------------------------------------------------------------------ #
+    # Discord lines — split into chunks under 1900 chars                  #
+    # ------------------------------------------------------------------ #
     all_lines = [
-        f"**[{tag}] {guild_name} — Roster ({len(members)} members)**",
+        f"**[{tag}] {guild_name} — Roster ({len(full_members)} members)**",
         f"-# Last updated: {now}\n"
     ]
-    for rank, names in sorted(by_rank.items()):
+    for rank in sorted_ranks(by_rank):
+        names  = by_rank[rank]
+        is_inv = rank.lower() == "invited"
         all_lines.append(f"**{rank}** ({len(names)})")
         for name in names:
-            suffix = " ✅" if name in verified_names else ""
-            all_lines.append(f"  • {name}{suffix}")
+            verified_suffix = " ✅" if name in verified_names else ""
+            join_suffix     = discord_join(name, is_inv)
+            all_lines.append(f"  • {name}{verified_suffix}{join_suffix}")
+        all_lines.append("")
+
+    if recently_left:
+        all_lines.append(f"**Recently Left** ({len(recently_left)})")
+        for name, info in sorted(recently_left.items()):
+            left_at   = info.get("left_at", "Unknown")
+            joined_at = info.get("joined_at", "Unknown")
+            all_lines.append(f"  • ~~{name}~~")
+            all_lines.append(f"    Joined: {joined_at}")
+            all_lines.append(f"    Left: {left_at}")
         all_lines.append("")
 
     chunks = []
@@ -466,8 +815,12 @@ class RosterView(discord.ui.View):
 
         try:
             guild_data, members = await fetch_roster(cfg["api_key"], cfg["gw2_guild_id"])
-            verified = cfg.get("verified", {})
-            _chunks, plain_text = build_roster_text(guild_data, members, verified)
+            verified      = cfg.get("verified", {})
+            join_dates    = cfg.get("join_dates", {})
+            recently_left = cfg.get("recently_left", {})
+            _chunks, plain_text = build_roster_text(
+                guild_data, members, verified, join_dates, recently_left
+            )
         except Exception as e:
             await interaction.followup.send(f"❌ Failed to fetch roster: {e}", ephemeral=True)
             return
@@ -610,7 +963,14 @@ class AnonymityChoiceView(discord.ui.View):
 async def post_or_edit_roster(channel: discord.TextChannel, cfg: dict, guild_id: int):
     guild_data, members = await fetch_roster(cfg["api_key"], cfg["gw2_guild_id"])
     verified = cfg.get("verified", {})
-    chunks, _ = build_roster_text(guild_data, members, verified)
+
+    # Update tracking data before building the roster text so the display
+    # reflects the current state. Both helpers mutate cfg in-place and
+    # persist their changes via set_guild_config at the end of this function.
+    recently_left = update_recently_left(cfg, members)
+    join_dates    = update_member_join_dates(cfg, members)
+
+    chunks, _ = build_roster_text(guild_data, members, verified, join_dates, recently_left)
 
     # cfg["message_ids"] is the new field — list of message IDs in order.
     # cfg["message_id"] (old single-message field) is migrated on first run.
@@ -625,6 +985,8 @@ async def post_or_edit_roster(channel: discord.TextChannel, cfg: dict, guild_id:
     # Edit or post messages for each chunk
     new_ids: list[int] = []
     for i, chunk in enumerate(chunks):
+        if i > 0:
+            await asyncio.sleep(2)  # avoid Discord rate limits on rapid edits
         view = final_view if i == needed - 1 else None
         if i < have:
             # Try to edit existing message
@@ -664,37 +1026,62 @@ async def post_or_edit_roster(channel: discord.TextChannel, cfg: dict, guild_id:
 # ---------------------------------------------------------------------------
 
 async def sync_verifications(discord_guild: discord.Guild, cfg: dict, members: list):
+    """
+    Called on every roster update cycle.
+    1. Unlinks GW2 accounts that have left the guild and updates their nickname.
+    2. For every verified Discord member still in the guild, ensures they hold
+       the correct rank role (and only that rank role).
+    """
     current_gw2_names = {m["name"] for m in members}
-    verified = cfg.get("verified", {})
+    verified          = cfg.get("verified", {})
+    guest_role_name   = get_guest_role_name(cfg)
 
+    # ── Step 1: unlink accounts that left the guild ──────────────────────
     to_unlink = [gw2_name for gw2_name in verified if gw2_name not in current_gw2_names]
 
     for gw2_name in to_unlink:
         discord_user_id = verified[gw2_name]
         logging.info(f"{gw2_name} left the GW2 guild — unlinking Discord user {discord_user_id}")
 
-        try:
-            pass  # Roles are intentionally left unchanged when accounts are unlinked
-        except Exception:
-            pass
-
-        # Update nickname to reflect remaining accounts, or reset if none left
         remaining = find_gw2_names_for_discord_user(discord_guild.id, discord_user_id)
-        # Remove this account from remaining (it's still in verified at this point)
         remaining = [n for n in remaining if n != gw2_name]
+
         try:
             member_obj = await discord_guild.fetch_member(discord_user_id)
             nick = build_nickname(remaining)
             await member_obj.edit(nick=nick, reason="GW2 account left guild — nickname updated")
-        except (discord.NotFound, discord.Forbidden):
-            pass
+
+            # Recalculate rank from remaining accounts; remove all rank roles if none left
+            new_rank = highest_rank(remaining, members) if remaining else None
+            await apply_rank_role(discord_guild, member_obj, new_rank, guest_role_name)
+
+        except discord.NotFound:
+            pass  # Member left the Discord server
+        except discord.Forbidden:
+            logging.warning(f"Missing permissions to update member {discord_user_id}")
         except Exception as e:
-            logging.warning(f"Nickname update failed during sync for {discord_user_id}: {e}")
+            logging.warning(f"Failed to update member {discord_user_id} after GW2 unlink: {e}")
 
         unlink_account(discord_guild.id, gw2_name)
 
     if to_unlink:
         logging.info(f"Unlinked {len(to_unlink)} accounts that left the GW2 guild: {to_unlink}")
+
+    # ── Step 2: sync rank roles for all currently verified members ───────
+    # Build a map of discord_user_id -> [gw2_names] for everyone still verified
+    verified_now = cfg.get("verified", {})  # reload after unlinking
+    discord_to_gw2: dict[int, list[str]] = {}
+    for gw2_name, discord_id in verified_now.items():
+        discord_to_gw2.setdefault(discord_id, []).append(gw2_name)
+
+    for discord_user_id, gw2_names in discord_to_gw2.items():
+        try:
+            member_obj = await discord_guild.fetch_member(discord_user_id)
+        except (discord.NotFound, discord.HTTPException):
+            continue
+
+        rank = highest_rank(gw2_names, members)
+        await apply_rank_role(discord_guild, member_obj, rank, guest_role_name)
 
 # ---------------------------------------------------------------------------
 # Bot
@@ -707,8 +1094,51 @@ bot  = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 
+def migrate_date_formats():
+    """
+    One-time migration: reformat any join_dates / recently_left timestamps
+    still stored in the old '%Y-%m-%d %H:%M UTC' style (e.g. '2026-08-05 01:00 UTC')
+    to the current '%-d %b %Y, %H:%M UTC' style (e.g. '5 Aug 2026, 01:00 UTC').
+    Safe to run on every startup — already-migrated dates are left untouched.
+    """
+    OLD_FMT = "%Y-%m-%d %H:%M UTC"
+    config  = load_config()
+    changed = False
+
+    for guild_id_str, cfg in config.items():
+        if not guild_id_str.isdigit() or not isinstance(cfg, dict):
+            continue
+
+        for name, date_str in list(cfg.get("join_dates", {}).items()):
+            try:
+                dt = datetime.strptime(date_str, OLD_FMT).replace(tzinfo=timezone.utc)
+                cfg["join_dates"][name] = fmt_date(dt)
+                changed = True
+            except ValueError:
+                pass  # Already in new format or unrecognised — leave it
+
+        for name, info in list(cfg.get("recently_left", {}).items()):
+            if not isinstance(info, dict):
+                continue
+            for key in ("left_at", "joined_at"):
+                val = info.get(key)
+                if not val:
+                    continue
+                try:
+                    dt = datetime.strptime(val, OLD_FMT).replace(tzinfo=timezone.utc)
+                    info[key] = fmt_date(dt)
+                    changed = True
+                except ValueError:
+                    pass
+
+    if changed:
+        save_config(config)
+        logging.info("Migrated stored dates from old format to new format.")
+
+
 @bot.event
 async def on_ready():
+    migrate_date_formats()
     bot.add_view(RosterView())
     bot.add_view(ReportView())
     await tree.sync()
@@ -717,55 +1147,125 @@ async def on_ready():
         roster_loop.start()
     # Build item cache in background — bot is usable immediately
     asyncio.create_task(build_item_cache())
+    # Clean up verified accounts for members who left while the bot was offline
+    asyncio.create_task(_cleanup_departed_members())
+
+
+async def _cleanup_departed_members():
+    """
+    On startup, unlink any verified GW2 accounts whose Discord user is no
+    longer a member of the server.  Catches anyone who left while the bot
+    was offline (including the member who triggered this fix).
+    """
+    config = load_config()
+    for guild_id_str, cfg in config.items():
+        if not guild_id_str.isdigit() or not isinstance(cfg, dict):
+            continue
+        verified = cfg.get("verified", {})
+        if not verified:
+            continue
+
+        discord_guild = bot.get_guild(int(guild_id_str))
+        if not discord_guild:
+            continue
+
+        # Fetch the full member list so we have accurate data
+        try:
+            member_ids = {m.id for m in discord_guild.members}
+        except Exception as e:
+            logging.warning(f"Could not fetch members for guild {guild_id_str} during cleanup: {e}")
+            continue
+
+        to_unlink = [
+            gw2_name for gw2_name, discord_id in verified.items()
+            if discord_id not in member_ids
+        ]
+
+        for gw2_name in to_unlink:
+            unlink_account(int(guild_id_str), gw2_name)
+
+        if to_unlink:
+            logging.info(
+                f"Startup cleanup — unlinked {len(to_unlink)} GW2 account(s) "
+                f"for departed Discord members in guild {guild_id_str}: {to_unlink}"
+            )
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    """Unlink all GW2 accounts belonging to a Discord member who left the server."""
+    if member.bot:
+        return
+
+    guild_id  = member.guild.id
+    gw2_names = find_gw2_names_for_discord_user(guild_id, member.id)
+    if not gw2_names:
+        return
+
+    for gw2_name in gw2_names:
+        unlink_account(guild_id, gw2_name)
+
+    logging.info(
+        f"Discord member {member.id} left guild {guild_id} — "
+        f"unlinked GW2 account(s): {gw2_names}"
+    )
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore messages from bots (including ourselves)
-    if message.author.bot:
-        return
-    # Ignore DMs
-    if not message.guild:
+    # Ignore bots and DMs
+    if message.author.bot or not message.guild:
         return
 
     autodelete_channels = get_autodelete_channels(message.guild.id)
-    if message.channel.id not in autodelete_channels:
-        return
+    if message.channel.id in autodelete_channels:
+        asyncio.create_task(_autodelete(message))
 
-    # Allow slash commands — they start with "/" and Discord sends them as
-    # interaction payloads, so by the time on_message fires the content is
-    # empty for slash commands. Delete anything with actual text content.
-    if message.content or message.attachments or message.embeds:
+
+async def _autodelete(message: discord.Message):
+    """Delete a message with up to 3 retries on transient HTTP errors."""
+    for attempt in range(3):
         try:
             await message.delete()
             logging.info(
-                f"Auto-deleted message from {message.author} "
+                f"Auto-deleted message {message.id} from {message.author} "
                 f"in #{message.channel.name} ({message.guild.name})"
             )
-        except discord.Forbidden:
-            logging.warning(f"Missing permissions to delete message in #{message.channel.name}")
+            return
         except discord.NotFound:
-            pass  # Already deleted
+            return  # Already gone — fine
+        except discord.Forbidden:
+            logging.warning(
+                f"Missing Manage Messages permission in #{message.channel.name} "
+                f"({message.guild.name})"
+            )
+            return  # Retrying won't help
+        except discord.HTTPException as e:
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+            else:
+                logging.warning(
+                    f"Auto-delete failed after 3 attempts for message "
+                    f"{message.id} in #{message.channel.name}: {e}"
+                )
 
 # ---------------------------------------------------------------------------
 # /setup
 # ---------------------------------------------------------------------------
 
-@tree.command(name="setup", description="Configure the GW2 roster bot (admin only).")
+@tree.command(name="setup", description="[Admin] Configure the GW2 roster bot.")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     api_key      = "Your GW2 API key (guilds permission, must be guild leader)",
     gw2_guild_id = "Your GW2 Guild ID (UUID)",
     channel      = "Channel to post the daily roster in",
-    member_role  = "Role to grant on verification (default: role named 'Member')",
-    guest_role   = "Role to remove on verification (default: role named 'Guest')",
+    guest_role   = "Role to remove when a member verifies (default: role named 'Guest')",
 )
 async def setup(
     interaction: discord.Interaction,
     api_key: str,
     gw2_guild_id: str,
     channel: discord.TextChannel,
-    member_role: discord.Role | None = None,
     guest_role: discord.Role | None = None,
 ):
     await interaction.response.defer(ephemeral=True)
@@ -784,31 +1284,15 @@ async def setup(
         await interaction.followup.send(f"❌ Unexpected error: {e}", ephemeral=True)
         return
 
-    existing_cfg     = get_guild_config(interaction.guild_id)
-    existing_verified = existing_cfg.get("verified", {}) if existing_cfg else {}
+    existing_cfg           = get_guild_config(interaction.guild_id)
+    existing_verified      = existing_cfg.get("verified", {}) if existing_cfg else {}
+    existing_join_dates    = existing_cfg.get("join_dates", {}) if existing_cfg else {}
+    existing_recently_left = existing_cfg.get("recently_left", {}) if existing_cfg else {}
+    existing_guest_name    = existing_cfg.get("guest_role_name", "Guest") if existing_cfg else "Guest"
 
-    # Preserve existing role names if not specified this time, otherwise default to "Member"/"Guest"
-    existing_member_name = existing_cfg.get("member_role_name", "Member") if existing_cfg else "Member"
-    existing_guest_name  = existing_cfg.get("guest_role_name", "Guest") if existing_cfg else "Guest"
+    guest_role_name = guest_role.name if guest_role else existing_guest_name
 
-    member_role_name = member_role.name if member_role else existing_member_name
-    guest_role_name  = guest_role.name if guest_role else existing_guest_name
-
-    # Verify the Member role actually exists on this server before saving.
-    # Guest role is optional in general usage, but if a name is set (explicitly
-    # or via default), it must exist too — otherwise fail loudly now rather
-    # than silently later.
-    resolved_member_role = member_role or discord.utils.get(interaction.guild.roles, name=member_role_name)
-    resolved_guest_role  = guest_role or discord.utils.get(interaction.guild.roles, name=guest_role_name)
-
-    if not resolved_member_role:
-        await interaction.followup.send(
-            f"❌ Setup failed: no role named **{member_role_name}** exists on this server. "
-            f"Create the role first, or pick an existing one with the `member_role` option.",
-            ephemeral=True
-        )
-        return
-
+    resolved_guest_role = guest_role or discord.utils.get(interaction.guild.roles, name=guest_role_name)
     if not resolved_guest_role:
         await interaction.followup.send(
             f"❌ Setup failed: no role named **{guest_role_name}** exists on this server. "
@@ -823,8 +1307,9 @@ async def setup(
         "channel_id":       channel.id,
         "setup_by":         interaction.user.id,
         "verified":         existing_verified,
-        "member_role_name": member_role_name,
         "guest_role_name":  guest_role_name,
+        "join_dates":       existing_join_dates,
+        "recently_left":    existing_recently_left,
     }
     set_guild_config(interaction.guild_id, cfg)
 
@@ -835,10 +1320,12 @@ async def setup(
         return
 
     gw2_name = guild_data.get("name", gw2_guild_id)
+    rank_list = ", ".join(GUILD_RANKS)
     await interaction.followup.send(
         f"✅ Done! **{gw2_name}** roster ({len(members)} members) posted in {channel.mention}.\n"
-        f"Updates every hour on the hour. Members can use `/verify` to link their GW2 account.\n"
-        f"Verification grants the **{member_role_name}** role and removes **{guest_role_name}**.\n"
+        f"Updates every 10 minutes. Members can use `/verify` to link their GW2 account.\n"
+        f"On verification, the **{guest_role_name}** role is removed and the member's guild rank role is assigned automatically.\n"
+        f"Managed rank roles: {rank_list}.\n"
         f"Use `/unsetup` to remove this configuration.",
         ephemeral=True
     )
@@ -847,7 +1334,7 @@ async def setup(
 # /verify
 # ---------------------------------------------------------------------------
 
-@tree.command(name="verify", description="Verify your GW2 account to receive the Member role.")
+@tree.command(name="verify", description="Verify your GW2 account to receive your guild rank role.")
 @app_commands.describe(gw2_username="Your full GW2 account name, including the numbers (e.g. PlayerName.1234)")
 async def verify(interaction: discord.Interaction, gw2_username: str):
     await interaction.response.defer(ephemeral=True)
@@ -857,16 +1344,10 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
         await interaction.followup.send("❌ This bot has not been set up yet. An admin needs to run `/setup` first.", ephemeral=True)
         return
 
-    discord_guild = interaction.guild
-    member_role_name, guest_role_name = get_role_names(cfg)
-    member_role = discord.utils.get(discord_guild.roles, name=member_role_name)
-    guest_role  = discord.utils.get(discord_guild.roles, name=guest_role_name)
+    discord_guild   = interaction.guild
+    guest_role_name = get_guest_role_name(cfg)
 
-    if not member_role:
-        await interaction.followup.send(f"❌ Could not find a role named **{member_role_name}** on this server. Ask an admin to create it.", ephemeral=True)
-        return
-
-    verified = get_verified(interaction.guild_id)
+    verified     = get_verified(interaction.guild_id)
     gw2_username = gw2_username.strip()
 
     if gw2_username in verified:
@@ -882,7 +1363,8 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
         await interaction.followup.send(f"❌ Failed to fetch the guild roster: {e}", ephemeral=True)
         return
 
-    if gw2_username not in {m["name"] for m in members}:
+    member_data = {m["name"]: m for m in members}
+    if gw2_username not in member_data or member_data[gw2_username].get("rank", "").lower() == "invited":
         await interaction.followup.send(
             f"❌ **{gw2_username}** is not a member of the guild. "
             "Check your full account name including the numbers (e.g. `PlayerName.1234`).",
@@ -890,23 +1372,26 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
         )
         return
 
+    # Link the account first so highest_rank can see all accounts for this user
+    link_account(interaction.guild_id, gw2_username, interaction.user.id)
+
+    all_gw2_names = find_gw2_names_for_discord_user(interaction.guild_id, interaction.user.id)
+    rank = highest_rank(all_gw2_names, members)
+
     try:
-        if member_role not in interaction.user.roles:
-            await interaction.user.add_roles(member_role, reason="GW2 guild membership verified")
-        if guest_role and guest_role in interaction.user.roles:
-            await interaction.user.remove_roles(guest_role, reason="GW2 guild membership verified")
+        await apply_rank_role(discord_guild, interaction.user, rank, guest_role_name)
     except discord.Forbidden:
-        await interaction.followup.send("❌ I don't have permission to manage roles. Make sure my role is above Member and Guest.", ephemeral=True)
+        await interaction.followup.send(
+            "❌ I don't have permission to manage roles. Make sure my role is above the guild rank roles.",
+            ephemeral=True
+        )
         return
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to assign roles: {e}", ephemeral=True)
         return
 
-    link_account(interaction.guild_id, gw2_username, interaction.user.id)
-
     # Set nickname to all linked accounts
-    all_names = find_gw2_names_for_discord_user(interaction.guild_id, interaction.user.id)
-    nick = build_nickname(all_names)
+    nick = build_nickname(all_gw2_names)
     try:
         await interaction.user.edit(nick=nick, reason="GW2 verification — nickname updated")
     except discord.Forbidden:
@@ -914,10 +1399,10 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
     except Exception as e:
         logging.warning(f"Nickname set failed for {interaction.user.id}: {e}")
 
-    logging.info(f"Verified {gw2_username} as Discord user {interaction.user.id}")
+    logging.info(f"Verified {gw2_username} as Discord user {interaction.user.id} with rank {rank}")
 
     await interaction.followup.send(
-        f"✅ Verified! Welcome, **{gw2_username}**. You've been given the **{member_role_name}** role "
+        f"✅ Verified! Welcome, **{gw2_username}**. You've been given the **{rank}** role "
         f"and your server nickname has been updated.",
         ephemeral=True
     )
@@ -940,40 +1425,27 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
         await interaction.followup.send("❌ Bot is not set up yet. Run `/setup` first.", ephemeral=True)
         return
 
-    discord_guild = interaction.guild
-    member_role_name, guest_role_name = get_role_names(cfg)
-    member_role = discord.utils.get(discord_guild.roles, name=member_role_name)
-    guest_role  = discord.utils.get(discord_guild.roles, name=guest_role_name)
+    discord_guild   = interaction.guild
+    guest_role_name = get_guest_role_name(cfg)
 
-    if not member_role:
-        await interaction.followup.send(f"❌ Could not find a role named **{member_role_name}** on this server.", ephemeral=True)
-        return
-
-    verified = get_verified(interaction.guild_id)
+    verified     = get_verified(interaction.guild_id)
     gw2_username = gw2_username.strip()
 
-    # Check if the GW2 account is already linked to someone else
     if gw2_username in verified:
         if verified[gw2_username] == member.id:
-            await interaction.followup.send(
-                f"❌ **{gw2_username}** is already linked to {member.mention}.",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"❌ **{gw2_username}** is already linked to {member.mention}.", ephemeral=True)
         else:
-            await interaction.followup.send(
-                f"❌ **{gw2_username}** is already linked to another Discord user.",
-                ephemeral=True
-            )
+            await interaction.followup.send(f"❌ **{gw2_username}** is already linked to another Discord user.", ephemeral=True)
         return
 
-    # Check the account is actually in the guild
     try:
         _, members = await fetch_roster(cfg["api_key"], cfg["gw2_guild_id"])
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to fetch the guild roster: {e}", ephemeral=True)
         return
 
-    if gw2_username not in {m["name"] for m in members}:
+    member_data = {m["name"]: m for m in members}
+    if gw2_username not in member_data or member_data[gw2_username].get("rank", "").lower() == "invited":
         await interaction.followup.send(
             f"❌ **{gw2_username}** is not a member of the guild. "
             "Check the account name including the numbers (e.g. `PlayerName.1234`).",
@@ -981,12 +1453,14 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
         )
         return
 
-    # Assign roles
+    # Link first so highest_rank sees all accounts for this user
+    link_account(interaction.guild_id, gw2_username, member.id)
+
+    all_gw2_names = find_gw2_names_for_discord_user(interaction.guild_id, member.id)
+    rank = highest_rank(all_gw2_names, members)
+
     try:
-        if member_role not in member.roles:
-            await member.add_roles(member_role, reason=f"Force-verified by admin {interaction.user}")
-        if guest_role and guest_role in member.roles:
-            await member.remove_roles(guest_role, reason=f"Force-verified by admin {interaction.user}")
+        await apply_rank_role(discord_guild, member, rank, guest_role_name)
     except discord.Forbidden:
         await interaction.followup.send("❌ I don't have permission to manage roles.", ephemeral=True)
         return
@@ -995,18 +1469,7 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
         return
 
     # Set nickname
-    try:
-        await member.edit(nick=gw2_username, reason=f"Force-verified by admin {interaction.user}")
-    except discord.Forbidden:
-        logging.warning(f"Could not set nickname for {member.id} — missing permissions")
-    except Exception as e:
-        logging.warning(f"Nickname set failed for {member.id}: {e}")
-
-    link_account(interaction.guild_id, gw2_username, member.id)
-
-    # Update nickname to reflect all linked accounts
-    all_names = find_gw2_names_for_discord_user(interaction.guild_id, member.id)
-    nick = build_nickname(all_names)
+    nick = build_nickname(all_gw2_names)
     try:
         await member.edit(nick=nick, reason=f"Force-verified by admin {interaction.user}")
     except discord.Forbidden:
@@ -1014,10 +1477,10 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
     except Exception as e:
         logging.warning(f"Nickname set failed for {member.id}: {e}")
 
-    logging.info(f"Admin {interaction.user.id} force-verified {gw2_username} as Discord user {member.id}")
+    logging.info(f"Admin {interaction.user.id} force-verified {gw2_username} as Discord user {member.id} with rank {rank}")
 
     await interaction.followup.send(
-        f"✅ {member.mention} has been verified as **{gw2_username}** and given the **{member_role_name}** role.",
+        f"✅ {member.mention} has been verified as **{gw2_username}** and given the **{rank}** role.",
         ephemeral=True
     )
 
@@ -1031,7 +1494,7 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
 async def item_search(interaction: discord.Interaction, name: str):
     # Check guest role before deferring so ephemeral state is set correctly
     item_cfg = get_guild_config(interaction.guild_id)
-    _, guest_role_name = get_role_names(item_cfg) if item_cfg else (None, "Guest")
+    guest_role_name = get_guest_role_name(item_cfg) if item_cfg else "Guest"
     guest_role = discord.utils.get(interaction.guild.roles, name=guest_role_name)
     if guest_role and guest_role in interaction.user.roles:
         await interaction.response.send_message(
@@ -1384,7 +1847,7 @@ async def removereport(interaction: discord.Interaction):
 # /unsetup
 # ---------------------------------------------------------------------------
 
-@tree.command(name="unsetup", description="Remove the GW2 roster bot configuration for this server.")
+@tree.command(name="unsetup", description="[Admin] Remove the GW2 roster bot configuration for this server.")
 @app_commands.default_permissions(administrator=True)
 async def unsetup(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1402,6 +1865,331 @@ async def unsetup(interaction: discord.Interaction):
 
     delete_guild_config(interaction.guild_id)
     await interaction.followup.send("✅ Configuration removed.", ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# /viewsetup
+# ---------------------------------------------------------------------------
+
+@tree.command(name="viewsetup", description="[Admin] View a full summary of the bot's configuration for this server.")
+@app_commands.default_permissions(administrator=True)
+async def viewsetup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    cfg      = get_guild_config(guild_id)
+    rcfg     = get_report_config(guild_id)
+    ad_ids   = get_autodelete_channels(guild_id)
+
+    embed = discord.Embed(
+        title="⚙️ Bot Configuration",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # ── Roster / GW2 setup ──────────────────────────────────────────────
+    if cfg:
+        setup_by_id = cfg.get("setup_by")
+        if setup_by_id:
+            try:
+                setup_user   = await interaction.guild.fetch_member(setup_by_id)
+                setup_by_str = setup_user.mention
+            except (discord.NotFound, discord.HTTPException):
+                setup_by_str = f"Unknown user ({setup_by_id})"
+        else:
+            setup_by_str = "Unknown"
+
+        roster_channel   = interaction.guild.get_channel(cfg.get("channel_id", 0))
+        guest_role_name  = get_guest_role_name(cfg)
+        guest_role       = discord.utils.get(interaction.guild.roles, name=guest_role_name)
+
+        # Check which rank roles currently exist on the server
+        existing_rank_roles = [
+            discord.utils.get(interaction.guild.roles, name=r) for r in GUILD_RANKS
+        ]
+        rank_role_lines = []
+        for r_name, r_obj in zip(GUILD_RANKS, existing_rank_roles):
+            rank_role_lines.append(f"  {r_obj.mention if r_obj else f'⚠️ `{r_name}` (not yet created)'}")
+
+        # ── Discord server stats (no API call needed) ────────────────────
+        discord_members     = [m for m in interaction.guild.members if not m.bot]
+        discord_total       = len(discord_members)
+        verified_discord_ids = set(cfg.get("verified", {}).values())
+        verified_in_discord = sum(1 for m in discord_members if m.id in verified_discord_ids)
+        discord_verified_pct = (
+            f"{verified_in_discord / discord_total * 100:.0f}%" if discord_total else "N/A"
+        )
+
+        # ── Live roster stats from the GW2 API ──────────────────────────
+        try:
+            _, live_members = await fetch_roster(cfg["api_key"], cfg["gw2_guild_id"])
+
+            full_members   = [m for m in live_members if m.get("rank", "").lower() != "invited"]
+            invited_members = [m for m in live_members if m.get("rank", "").lower() == "invited"]
+            full_names     = {m["name"] for m in full_members}
+
+            verified       = cfg.get("verified", {})
+            verified_count = len(verified)
+            # How many verified GW2 accounts belong to someone who is still in the guild
+            verified_in_guild = sum(1 for gw2_name in verified if gw2_name in full_names)
+            unverified_count  = len(full_members) - verified_in_guild
+            verification_pct  = (
+                f"{verified_in_guild / len(full_members) * 100:.0f}%" if full_members else "N/A"
+            )
+
+            # Counts by rank
+            rank_counts: dict[str, int] = {}
+            for m in full_members:
+                rank_counts[m["rank"]] = rank_counts.get(m["rank"], 0) + 1
+
+            RANK_ORDER_DISPLAY = [
+                "Leader", "Officer", "Content Officer",
+                "Founding Member", "Member",
+            ]
+            rank_lines = []
+            for rank in RANK_ORDER_DISPLAY:
+                if rank in rank_counts:
+                    rank_lines.append(f"  {rank}: **{rank_counts[rank]}**")
+            for rank, count in sorted(rank_counts.items()):
+                if rank not in RANK_ORDER_DISPLAY:
+                    rank_lines.append(f"  {rank}: **{count}**")
+
+            recently_left     = cfg.get("recently_left", {})
+            recently_left_count = len(recently_left)
+            recently_left_names = (
+                ", ".join(sorted(recently_left.keys())) if recently_left else "None"
+            )
+            # Truncate if the list would be too long for an embed field
+            if len(recently_left_names) > 900:
+                recently_left_names = recently_left_names[:897] + "..."
+
+            next_run = roster_loop.next_iteration
+            next_run_str = (
+                discord.utils.format_dt(next_run, style="R")
+                if next_run else "Unknown"
+            )
+
+            embed.add_field(
+                name="📋 Roster",
+                value=(
+                    f"**Set up by:** {setup_by_str}\n"
+                    f"**Roster channel:** {roster_channel.mention if roster_channel else '⚠️ Channel not found'}\n"
+                    f"**GW2 Guild ID:** `{cfg.get('gw2_guild_id', 'Unknown')}`\n"
+                    f"**API key:** `{cfg.get('api_key', 'Unknown')}`\n"
+                    f"**Next auto-update:** {next_run_str}"
+                ),
+                inline=False,
+            )
+
+            embed.add_field(
+                name=f"👥 Guild Members ({len(full_members)})",
+                value="\n".join(rank_lines) if rank_lines else "No members found",
+                inline=True,
+            )
+
+            embed.add_field(
+                name=f"📩 Invited ({len(invited_members)})",
+                value=(
+                    f"Pending acceptance\n"
+                    f"*(not counted in member total)*"
+                ),
+                inline=True,
+            )
+
+            embed.add_field(name="\u200b", value="\u200b", inline=True)  # spacer
+
+            embed.add_field(
+                name="🔗 Verification",
+                value=(
+                    f"**Removes on verify:** {guest_role.mention if guest_role else f'⚠️ `{guest_role_name}` not found'}\n"
+                    f"**Assigns rank role:** matching guild rank (auto-created if missing)\n"
+                    f"**Managed rank roles:**\n" + "\n".join(rank_role_lines) + "\n"
+                    f"**Discord members (excl. bots):** {discord_total}\n"
+                    f"**Verified in Discord:** {verified_in_discord} / {discord_total} ({discord_verified_pct})\n"
+                    f"**Verified (in guild):** {verified_in_guild} / {len(full_members)} ({verification_pct})\n"
+                    f"**Unverified guild members:** {unverified_count}\n"
+                    f"**Total linked accounts:** {verified_count}"
+                ),
+                inline=False,
+            )
+
+            embed.add_field(
+                name=f"🚪 Recently Left ({recently_left_count})",
+                value=recently_left_names,
+                inline=False,
+            )
+
+        except Exception as e:
+            # API fetch failed — fall back to config-only data
+            verified_count = len(cfg.get("verified", {}))
+            recently_left_count = len(cfg.get("recently_left", {}))
+
+            embed.add_field(
+                name="📋 Roster",
+                value=(
+                    f"**Set up by:** {setup_by_str}\n"
+                    f"**Roster channel:** {roster_channel.mention if roster_channel else '⚠️ Channel not found'}\n"
+                    f"**GW2 Guild ID:** `{cfg.get('gw2_guild_id', 'Unknown')}`\n"
+                    f"**API key:** `{cfg.get('api_key', 'Unknown')}`\n"
+                    f"⚠️ Could not fetch live roster data: {e}"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="🔗 Verification",
+                value=(
+                    f"**Removes on verify:** {guest_role.mention if guest_role else f'⚠️ `{guest_role_name}` not found'}\n"
+                    f"**Assigns rank role:** matching guild rank (auto-created if missing)\n"
+                    f"**Discord members (excl. bots):** {discord_total}\n"
+                    f"**Verified in Discord:** {verified_in_discord} / {discord_total} ({discord_verified_pct})\n"
+                    f"**Linked accounts (cached):** {verified_count}\n"
+                    f"**Recently left (tracked):** {recently_left_count}"
+                ),
+                inline=False,
+            )
+    else:
+        embed.add_field(
+            name="📋 Roster",
+            value="Not configured. Run `/setup` to get started.",
+            inline=False,
+        )
+
+    # ── Report system ────────────────────────────────────────────────────
+    if rcfg:
+        button_channel = interaction.guild.get_channel(rcfg.get("button_channel_id", 0))
+        report_channel = interaction.guild.get_channel(rcfg.get("report_channel_id", 0))
+        embed.add_field(
+            name="📨 Report System",
+            value=(
+                f"**Button channel:** {button_channel.mention if button_channel else '⚠️ Channel not found'}\n"
+                f"**Reports sent to:** {report_channel.mention if report_channel else '⚠️ Channel not found'}"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="📨 Report System",
+            value="Not configured. Run `/setupreport` to enable.",
+            inline=False,
+        )
+
+    # ── Auto-delete channels ─────────────────────────────────────────────
+    if ad_ids:
+        lines = []
+        for cid in ad_ids:
+            ch = interaction.guild.get_channel(cid)
+            lines.append(ch.mention if ch else f"⚠️ Unknown channel ({cid})")
+        embed.add_field(
+            name=f"🗑️ Auto-delete Channels ({len(ad_ids)})",
+            value="\n".join(lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🗑️ Auto-delete Channels",
+            value="None configured. Run `/setupautodelete` to add one.",
+            inline=False,
+        )
+
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    logging.info(f"Admin {interaction.user.id} viewed setup in guild {guild_id}")
+
+
+# ---------------------------------------------------------------------------
+# Giveaway update
+# ---------------------------------------------------------------------------
+
+async def update_giveaway(discord_guild_id: int, name: str, giveaway: dict):
+    """
+    Fetch the guild log, find new qualifying donations for this giveaway,
+    update the entry list, and edit the Discord message.
+    """
+    cfg = get_guild_config(discord_guild_id)
+    if not cfg:
+        return
+
+    api_key      = cfg.get("api_key")
+    gw2_guild_id = cfg.get("gw2_guild_id")
+    if not api_key or not gw2_guild_id:
+        return
+
+    channel = bot.get_channel(giveaway["channel_id"])
+    if not channel:
+        return
+
+    # created_at is stored as ISO 8601 internally for comparison
+    created_dt = datetime.fromisoformat(giveaway["created_at"])
+    min_copper = giveaway["min_gold"] * 10_000
+    entries    = set(giveaway.get("entries", []))
+
+    try:
+        log_entries = await fetch_guild_log(api_key, gw2_guild_id)
+    except Exception as e:
+        logging.warning(f"Failed to fetch guild log for giveaway '{name}': {e}")
+        return
+
+    for entry in log_entries:
+        # Only guild stash entries
+        if entry.get("type") != "stash":
+            continue
+        # Withdrawals have negative coins or operation == "withdraw"; skip them.
+        # Some API responses omit "operation" entirely for deposits, so we check
+        # the operation only if it's present.
+        op = entry.get("operation")
+        if op is not None and op != "deposit":
+            continue
+        # Item donations have a non-zero item_id — coin deposits use item_id: 0
+        if entry.get("item_id", 0) != 0:
+            continue
+        coins = entry.get("coins", 0)
+        if not isinstance(coins, int) or coins <= 0:
+            continue
+
+        # Only count entries after the giveaway was created
+        ts_str = entry.get("time", "")
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except ValueError:
+            logging.warning(f"Giveaway '{name}' — could not parse timestamp: {ts_str!r}")
+            continue
+        if ts <= created_dt:
+            continue
+
+        # Check minimum donation threshold
+        if coins < min_copper:
+            continue
+
+        gw2_name = entry.get("user", "")
+        if gw2_name and gw2_name not in entries:
+            logging.info(f"Giveaway '{name}' — adding entry: {gw2_name} ({coins} copper)")
+            entries.add(gw2_name)
+
+    # Persist updated entries
+    giveaway["entries"] = sorted(entries)
+    save_giveaway(discord_guild_id, name, giveaway)
+
+    # Edit the Discord message — display_created_at is a human-readable version
+    display_created_at = fmt_date(created_dt)
+    content = build_giveaway_text(
+        name, giveaway["entries"], giveaway["min_gold"],
+        display_created_at, closed=giveaway.get("closed", False)
+    )
+    msg_id = giveaway.get("message_id")
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(content=content)
+        except discord.NotFound:
+            msg = await channel.send(content)
+            giveaway["message_id"] = msg.id
+            save_giveaway(discord_guild_id, name, giveaway)
+        except Exception as e:
+            logging.warning(f"Failed to edit giveaway message for '{name}': {e}")
+    else:
+        msg = await channel.send(content)
+        giveaway["message_id"] = msg.id
+        save_giveaway(discord_guild_id, name, giveaway)
+
 
 # ---------------------------------------------------------------------------
 # Roster update loop
@@ -1426,8 +2214,241 @@ async def roster_loop():
             members = await post_or_edit_roster(channel, cfg, guild_id)
             if discord_guild and members:
                 await sync_verifications(discord_guild, cfg, members)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 403:
+                logging.error(
+                    f"GW2 API 403 Forbidden for guild {guild_id} — API key is invalid, "
+                    f"missing 'guilds' scope, or account is no longer guild leader. "
+                    f"Run /setup again with a valid API key."
+                )
+                try:
+                    await channel.send(
+                        "⚠️ **Roster update failed** — the GW2 API key is no longer valid (403 Forbidden).\n"
+                        "This usually means the key was regenerated, the account is no longer guild leader, "
+                        "or the key is missing the `guilds` permission.\n"
+                        "An admin needs to run `/setup` again with a valid API key.",
+                    )
+                except Exception:
+                    pass
+            else:
+                logging.error(f"GW2 API error for guild {guild_id}: HTTP {e.status} — {e}")
         except Exception as e:
             logging.error(f"Failed to update roster for guild {guild_id}: {e}")
+
+    # Update all active giveaways across all guilds
+    full_config = load_config()
+    for guild_id_str, guild_giveaways in full_config.get("giveaways", {}).items():
+        if not guild_id_str.isdigit():
+            continue
+        for giveaway_name, giveaway in guild_giveaways.items():
+            if giveaway.get("closed"):
+                continue
+            try:
+                await update_giveaway(int(guild_id_str), giveaway_name, giveaway)
+            except Exception as e:
+                logging.error(f"Failed to update giveaway '{giveaway_name}' in guild {guild_id_str}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# /setupgiveaway  /announcewinner  /removegiveaway
+# ---------------------------------------------------------------------------
+
+@tree.command(name="setupgiveaway", description="[Admin] Create a new giveaway tracked by guild bank donations.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    channel  = "Channel to post the giveaway entry list in",
+    name     = "Unique name for this giveaway (e.g. 'summer2026')",
+    min_gold = "Minimum whole gold donation required to enter (e.g. 1, 5, 10)",
+)
+async def setupgiveaway(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    name: str,
+    min_gold: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if min_gold < 1:
+        await interaction.followup.send("❌ Minimum gold must be at least 1.", ephemeral=True)
+        return
+
+    cfg = get_guild_config(interaction.guild_id)
+    if not cfg:
+        await interaction.followup.send("❌ Bot is not set up yet. Run `/setup` first.", ephemeral=True)
+        return
+
+    existing = get_giveaway(interaction.guild_id, name)
+    if existing:
+        await interaction.followup.send(
+            f"❌ A giveaway named **{name}** already exists. Choose a unique name or remove the existing one first.",
+            ephemeral=True
+        )
+        return
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    giveaway = {
+        "channel_id": channel.id,
+        "message_id": None,
+        "min_gold":   min_gold,
+        "created_at": created_at,
+        "entries":    [],
+        "closed":     False,
+    }
+    save_giveaway(interaction.guild_id, name, giveaway)
+
+    # Post the initial message immediately
+    content = build_giveaway_text(name, [], min_gold, fmt_date(datetime.now(timezone.utc)))
+    msg = await channel.send(content)
+    giveaway["message_id"] = msg.id
+    save_giveaway(interaction.guild_id, name, giveaway)
+
+    await interaction.followup.send(
+        f"✅ Giveaway **{name}** created in {channel.mention}!\n"
+        f"Members who donate at least **{min_gold} gold** to the guild bank after "
+        f"{fmt_date(datetime.now(timezone.utc))} will be automatically added to the entry list.\n"
+        f"The list updates every 10 minutes.",
+        ephemeral=True
+    )
+    logging.info(f"Admin {interaction.user.id} created giveaway '{name}' in guild {interaction.guild_id}")
+
+
+@tree.command(name="announcewinner", description="[Admin] Close a giveaway and announce the winners.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    name       = "The unique name of the giveaway to close",
+    num_winners = "How many winners to draw",
+)
+async def announcewinner(
+    interaction: discord.Interaction,
+    name: str,
+    num_winners: int,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if num_winners < 1:
+        await interaction.followup.send("❌ Number of winners must be at least 1.", ephemeral=True)
+        return
+
+    giveaway = get_giveaway(interaction.guild_id, name)
+    if not giveaway:
+        await interaction.followup.send(f"❌ No giveaway named **{name}** found.", ephemeral=True)
+        return
+
+    if giveaway.get("closed"):
+        await interaction.followup.send(f"❌ Giveaway **{name}** is already closed.", ephemeral=True)
+        return
+
+    channel = bot.get_channel(giveaway["channel_id"])
+    if not channel:
+        await interaction.followup.send("❌ The giveaway channel no longer exists.", ephemeral=True)
+        return
+
+    # Do one final entry update before closing
+    cfg = get_guild_config(interaction.guild_id)
+    if cfg:
+        try:
+            await update_giveaway(interaction.guild_id, name, giveaway)
+            # Reload after update
+            giveaway = get_giveaway(interaction.guild_id, name)
+        except Exception as e:
+            logging.warning(f"Final entry update failed before announcing winners for '{name}': {e}")
+
+    entries = giveaway.get("entries", [])
+
+    # Draw winners
+    import random
+    pool         = list(entries)
+    actual_count = min(num_winners, len(pool))
+    winners      = random.sample(pool, actual_count) if pool else []
+
+    # Mark closed and edit the entry list message
+    giveaway["closed"] = True
+    save_giveaway(interaction.guild_id, name, giveaway)
+
+    closed_content = build_giveaway_text(
+        name, entries, giveaway["min_gold"], giveaway["created_at"], closed=True
+    )
+    msg_id = giveaway.get("message_id")
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.edit(content=closed_content)
+        except (discord.NotFound, Exception):
+            pass
+
+    # Build winner announcement
+    verified = get_verified(interaction.guild_id)
+    # Reverse map: gw2_name -> discord_user_id
+    gw2_to_discord = {gw2: uid for gw2, uid in verified.items()}
+
+    if not winners:
+        announcement = (
+            f"🎉 **{name} — Giveaway Closed**\n\n"
+            f"No winners could be drawn — there were no eligible entries."
+        )
+    else:
+        winner_lines = []
+        for gw2_name in winners:
+            discord_uid = gw2_to_discord.get(gw2_name)
+            if discord_uid:
+                try:
+                    discord_member = await interaction.guild.fetch_member(discord_uid)
+                    discord_str    = f"{discord_member.mention} ({discord_member.display_name})"
+                except (discord.NotFound, discord.HTTPException):
+                    discord_str = "*Discord account not found*"
+            else:
+                discord_str = "*Not verified*"
+            winner_lines.append(f"🏆 **{gw2_name}** — {discord_str}")
+
+        drawn_str   = f"{actual_count} winner{'s' if actual_count != 1 else ''}"
+        entries_str = f"{len(entries)} entr{'ies' if len(entries) != 1 else 'y'}"
+        announcement = (
+            f"🎉 **{name} — Giveaway Winners!**\n"
+            f"Drawn from {entries_str}:\n\n"
+            + "\n".join(winner_lines)
+        )
+
+        if actual_count < num_winners:
+            announcement += f"\n\n*Note: Only {actual_count} winner(s) drawn — not enough entries for {num_winners}.*"
+
+    await channel.send(announcement)
+    await interaction.followup.send(
+        f"✅ Giveaway **{name}** closed. {len(winners)} winner(s) announced in {channel.mention}.",
+        ephemeral=True
+    )
+    logging.info(
+        f"Admin {interaction.user.id} announced {len(winners)} winner(s) "
+        f"for giveaway '{name}' in guild {interaction.guild_id}: {winners}"
+    )
+
+
+@tree.command(name="removegiveaway", description="[Admin] Delete a giveaway and remove its message.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(name="The unique name of the giveaway to delete")
+async def removegiveaway(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    giveaway = get_giveaway(interaction.guild_id, name)
+    if not giveaway:
+        await interaction.followup.send(f"❌ No giveaway named **{name}** found.", ephemeral=True)
+        return
+
+    # Delete the Discord message
+    channel = bot.get_channel(giveaway["channel_id"])
+    if channel and giveaway.get("message_id"):
+        try:
+            msg = await channel.fetch_message(giveaway["message_id"])
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, Exception):
+            pass
+
+    delete_giveaway(interaction.guild_id, name)
+
+    await interaction.followup.send(
+        f"✅ Giveaway **{name}** has been deleted.",
+        ephemeral=True
+    )
+    logging.info(f"Admin {interaction.user.id} deleted giveaway '{name}' in guild {interaction.guild_id}")
 
 
 bot.run(DISCORD_TOKEN)

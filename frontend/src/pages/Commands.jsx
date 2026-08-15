@@ -53,7 +53,7 @@ export default function Commands() {
         <SectionHeader
           overline="Reference"
           title="Complete command list"
-          sub="Twelve slash commands. Member commands are open to everyone; admin commands require server administrator permissions."
+          sub="Eighteen slash commands. Member commands are open to everyone; admin commands require server administrator permissions."
         />
 
         {/* Tabs */}

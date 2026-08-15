@@ -11,7 +11,7 @@ export default function Features() {
         <SectionHeader
           overline="Capabilities"
           title="Built for Guild Wars 2 guilds"
-          sub="Every feature talks directly to the official GW2 API, so what your members see is always live and accurate."
+          sub="Every feature talks directly to the official GW2 API — rosters, rank sync, item prices, giveaways, reports, and moderation, all in one bot."
         />
 
         <div className="mt-16 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
