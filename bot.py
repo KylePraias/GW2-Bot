@@ -978,32 +978,52 @@ async def post_or_edit_roster(channel: discord.TextChannel, cfg: dict, guild_id:
     if not existing_ids and cfg.get("message_id"):
         existing_ids = [cfg["message_id"]]
 
-    needed   = len(chunks)
-    have     = len(existing_ids)
-    final_view = RosterView()
+    # Last-sent content per chunk — used to skip edits when nothing changed.
+    # Chunk 0 (contains the "Last updated" timestamp) is always edited.
+    # All other chunks are only edited if their content has changed.
+    last_contents: list[str] = cfg.get("last_chunk_contents", [])
 
-    # Edit or post messages for each chunk
+    needed     = len(chunks)
+    have       = len(existing_ids)
+    final_view = RosterView()
     new_ids: list[int] = []
+    new_contents: list[str] = []
+    first_edit = True  # used to throttle — only sleep before 2nd+ actual edit
+
     for i, chunk in enumerate(chunks):
-        if i > 0:
-            await asyncio.sleep(2)  # avoid Discord rate limits on rapid edits
         view = final_view if i == needed - 1 else None
+
         if i < have:
-            # Try to edit existing message
+            # Chunk 0 always gets edited (timestamp). Chunks 1+ skipped if unchanged.
+            if i > 0 and i < len(last_contents) and chunk == last_contents[i]:
+                new_ids.append(existing_ids[i])
+                new_contents.append(chunk)
+                continue
+
+            if not first_edit:
+                await asyncio.sleep(2)
+            first_edit = False
+
             try:
                 msg = await channel.fetch_message(existing_ids[i])
                 await msg.edit(content=chunk, view=view)
                 new_ids.append(msg.id)
+                new_contents.append(chunk)
                 logging.info(f"Edited roster message {msg.id} (chunk {i+1}/{needed}) in #{channel.name}")
             except discord.NotFound:
-                # Message gone — post fresh
+                if not first_edit:
+                    await asyncio.sleep(2)
                 msg = await channel.send(content=chunk, view=view)
                 new_ids.append(msg.id)
+                new_contents.append(chunk)
                 logging.info(f"Re-posted roster message {msg.id} (chunk {i+1}/{needed}) in #{channel.name}")
         else:
-            # Need a new message
+            if not first_edit:
+                await asyncio.sleep(2)
+            first_edit = False
             msg = await channel.send(content=chunk, view=view)
             new_ids.append(msg.id)
+            new_contents.append(chunk)
             logging.info(f"Posted new roster message {msg.id} (chunk {i+1}/{needed}) in #{channel.name}")
 
     # Delete any leftover messages if roster shrank
@@ -1015,8 +1035,9 @@ async def post_or_edit_roster(channel: discord.TextChannel, cfg: dict, guild_id:
         except discord.NotFound:
             pass
 
-    # Save updated message IDs
-    cfg["message_ids"] = new_ids
+    # Save updated message IDs and last-sent content
+    cfg["message_ids"]         = new_ids
+    cfg["last_chunk_contents"] = new_contents
     cfg.pop("message_id", None)  # remove old single-id field
     set_guild_config(guild_id, cfg)
     return members
