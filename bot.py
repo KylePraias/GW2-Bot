@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 logging.basicConfig(level=logging.INFO)
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-CONFIG_FILE   = "/data/config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "config.json")
 # Update roster every 10 minutes (xx:00, xx:10, xx:20, xx:30, xx:40, xx:50)
 ROSTER_TIMES  = [dt_time(hour=h, minute=m) for h in range(24) for m in range(0, 60, 10)]
 
