@@ -7,7 +7,9 @@ import json
 import os
 import io
 import logging
-from datetime import datetime, timezone, time as dt_time
+import secrets
+from datetime import datetime, timedelta, timezone, time as dt_time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logging.basicConfig(level=logging.INFO)
 
@@ -15,10 +17,6 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CONFIG_FILE   = "/data/config.json"
 # Update roster every 10 minutes (xx:00, xx:10, xx:20, xx:30, xx:40, xx:50)
 ROSTER_TIMES  = [dt_time(hour=h, minute=m) for h in range(24) for m in range(0, 60, 10)]
-
-# In-memory item cache: list of {"id": int, "name": str}
-item_cache: list[dict] = []
-item_cache_ready = False
 
 # ---------------------------------------------------------------------------
 # Config
@@ -250,6 +248,74 @@ async def apply_rank_role(
         logging.warning(f"Failed to update rank roles for {discord_member.id}: {e}")
 
 # ---------------------------------------------------------------------------
+# Leadership role management
+# Any Discord member holding either the "Officer" or "Leader" rank role also
+# gets given a separate "Leadership" role. This is an additional tag role —
+# members keep their normal rank role too.
+# ---------------------------------------------------------------------------
+
+LEADERSHIP_ROLE_NAME    = "Leadership"
+LEADERSHIP_ROLE_COLOUR  = 0x9b59b6
+LEADERSHIP_SOURCE_RANKS = {"Leader", "Officer"}
+
+
+async def ensure_leadership_role(discord_guild: discord.Guild) -> discord.Role:
+    """
+    Return the Discord 'Leadership' role, creating it if it does not exist.
+    The role is not hoisted (members with it are not displayed separately in
+    the member list), coloured 0x9b59b6, and positioned as the highest role
+    in the server besides the bot's own role(s).
+    """
+    role = discord.utils.get(discord_guild.roles, name=LEADERSHIP_ROLE_NAME)
+    if role:
+        return role
+
+    role = await discord_guild.create_role(
+        name=LEADERSHIP_ROLE_NAME,
+        colour=discord.Colour(LEADERSHIP_ROLE_COLOUR),
+        hoist=False,
+        reason="Leadership role auto-created by roster bot",
+    )
+    logging.info(f"Created Leadership role in guild {discord_guild.id}")
+
+    # Position it directly below the bot's highest role, i.e. the highest
+    # role in the server besides bot roles.
+    bot_member  = discord_guild.get_member(discord_guild.me.id)
+    bot_top_pos = max((r.position for r in bot_member.roles), default=1)
+    target_pos  = max(bot_top_pos - 1, 1)
+
+    try:
+        await discord_guild.edit_role_positions({role: target_pos})
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"Could not position Leadership role in guild {discord_guild.id}: {e}")
+
+    return role
+
+
+async def sync_leadership_roles(discord_guild: discord.Guild):
+    """
+    Called on every roster update cycle. Ensures every member currently
+    holding a 'Leader' or 'Officer' role also holds the 'Leadership' role,
+    and removes 'Leadership' from anyone who no longer holds either rank.
+    """
+    leadership_role = await ensure_leadership_role(discord_guild)
+
+    for member in discord_guild.members:
+        member_role_names = {r.name for r in member.roles}
+        should_have_leadership = bool(member_role_names & LEADERSHIP_SOURCE_RANKS)
+        has_leadership = any(r.id == leadership_role.id for r in member.roles)
+
+        try:
+            if should_have_leadership and not has_leadership:
+                await member.add_roles(leadership_role, reason="Holds Officer/Leader rank — granted Leadership role")
+            elif not should_have_leadership and has_leadership:
+                await member.remove_roles(leadership_role, reason="No longer holds Officer/Leader rank — removed Leadership role")
+        except discord.Forbidden:
+            logging.warning(f"Missing permissions to update Leadership role for {member.id} in guild {discord_guild.id}")
+        except Exception as e:
+            logging.warning(f"Failed to sync Leadership role for {member.id}: {e}")
+
+# ---------------------------------------------------------------------------
 # Autodelete channel helpers
 # Stored as a top-level key in config.json:
 # { "autodelete": { "<discord_guild_id>": [channel_id, ...] } }
@@ -304,6 +370,220 @@ def delete_giveaway(guild_id: int, name: str):
     config = load_config()
     config.get("giveaways", {}).get(str(guild_id), {}).pop(name, None)
     save_config(config)
+
+# ---------------------------------------------------------------------------
+# LFG helpers
+# Stored as top-level keys in config.json:
+# { "lfg_boards": { "<discord_guild_id>": {
+#       "channel_id": int,            # channel holding the button + calendar
+#       "announce_channel_id": int,   # "starting now" pings
+#       "button_message_id": int,
+#       "board_message_id": int,
+#       "setup_by": int
+#   } },
+#   "lfgs": { "<discord_guild_id>": { "<lfg_id>": {
+#       "id": str,
+#       "host_id": int,
+#       "name": str,
+#       "unix_ts": int,
+#       "max_slots": int,
+#       "roles": ["dps", ...],
+#       "signups": { "<role>": [user_id, ...] },
+#       "emoji_ids": { "<role>": emoji_id }
+#   } } } }
+# ---------------------------------------------------------------------------
+
+LFG_STANDARD_ROLES = ["dps", "qdps", "adps", "qheal", "aheal", "flex"]
+LFG_SIMPLE_ROLES   = ["dps"]
+LFG_MAX_CUSTOM     = 50
+LFG_BOARD_MAX      = 25   # one dropdown option per LFG; Discord select menus hold at most 25
+
+# Dropdown choices for the /lfg timezone picker (Discord allows max 25 options).
+# Values are IANA names so daylight saving is handled automatically.
+LFG_TZ_CHOICES = [
+    ("PT – Pacific (Los Angeles, Vancouver)",   "America/Los_Angeles"),
+    ("MT – Mountain (Denver, Edmonton)",        "America/Denver"),
+    ("MST – Arizona (no DST)",                  "America/Phoenix"),
+    ("CT – Central (Chicago, Winnipeg)",        "America/Chicago"),
+    ("ET – Eastern (New York, Toronto)",        "America/New_York"),
+    ("AT – Atlantic (Halifax)",                 "America/Halifax"),
+    ("NT – Newfoundland (St. John's)",          "America/St_Johns"),
+    ("AKT – Alaska (Anchorage)",                "America/Anchorage"),
+    ("HST – Hawaii (Honolulu)",                 "Pacific/Honolulu"),
+    ("BRT – Brazil (Sao Paulo)",                "America/Sao_Paulo"),
+    ("UTC – Coordinated Universal Time",        "UTC"),
+    ("GMT/BST – UK / Ireland (London)",         "Europe/London"),
+    ("CET/CEST – Central Europe (Paris, Berlin)", "Europe/Paris"),
+    ("EET/EEST – Eastern Europe (Athens, Helsinki)", "Europe/Athens"),
+    ("MSK – Moscow",                            "Europe/Moscow"),
+    ("IST – India (Kolkata)",                   "Asia/Kolkata"),
+    ("CST – China / Singapore (Shanghai)",      "Asia/Shanghai"),
+    ("JST – Japan / Korea (Tokyo)",             "Asia/Tokyo"),
+    ("AEST/AEDT – Australia East (Sydney)",     "Australia/Sydney"),
+    ("AWST – Australia West (Perth)",           "Australia/Perth"),
+    ("NZST/NZDT – New Zealand (Auckland)",      "Pacific/Auckland"),
+]
+LFG_TZ_LABELS = {value: label for label, value in LFG_TZ_CHOICES}
+
+TZ_ALIASES = {
+    "UTC": "UTC", "GMT": "UTC", "Z": "UTC",
+    "EST": "America/New_York", "EDT": "America/New_York", "ET": "America/New_York",
+    "CST": "America/Chicago", "CDT": "America/Chicago", "CT": "America/Chicago",
+    "MST": "America/Denver", "MDT": "America/Denver", "MT": "America/Denver",
+    "PST": "America/Los_Angeles", "PDT": "America/Los_Angeles", "PT": "America/Los_Angeles",
+    "AKST": "America/Anchorage", "AKDT": "America/Anchorage",
+    "HST": "Pacific/Honolulu",
+    "AST": "America/Halifax", "ADT": "America/Halifax",
+    "NST": "America/St_Johns", "NDT": "America/St_Johns",
+    "BST": "Europe/London", "CET": "Europe/Paris", "CEST": "Europe/Paris",
+    "AEST": "Australia/Sydney", "AEDT": "Australia/Sydney",
+}
+
+_lfg_lock: asyncio.Lock | None = None
+
+
+def get_lfg_lock() -> asyncio.Lock:
+    global _lfg_lock
+    if _lfg_lock is None:
+        _lfg_lock = asyncio.Lock()
+    return _lfg_lock
+
+
+def get_guild_lfgs(guild_id: int) -> dict:
+    return load_config().get("lfgs", {}).get(str(guild_id), {})
+
+
+def get_lfg(guild_id: int, lfg_id: str) -> dict | None:
+    return get_guild_lfgs(guild_id).get(str(lfg_id))
+
+
+def save_lfg(guild_id: int, lfg_id: str, data: dict):
+    config = load_config()
+    config.setdefault("lfgs", {}).setdefault(str(guild_id), {})[str(lfg_id)] = data
+    save_config(config)
+
+
+def delete_lfg(guild_id: int, lfg_id: str):
+    config = load_config()
+    guild_lfgs = config.get("lfgs", {}).get(str(guild_id), {})
+    guild_lfgs.pop(str(lfg_id), None)
+    save_config(config)
+
+
+def sorted_lfg_entries(guild_id: int) -> list[tuple[str, dict]]:
+    """Active LFGs for a guild as (lfg_id, lfg) pairs, soonest first."""
+    return sorted(
+        get_guild_lfgs(guild_id).items(),
+        key=lambda kv: int(kv[1].get("unix_ts", 0)),
+    )
+
+
+def get_lfg_board(guild_id: int) -> dict | None:
+    return load_config().get("lfg_boards", {}).get(str(guild_id))
+
+
+def set_lfg_board(guild_id: int, data: dict):
+    config = load_config()
+    config.setdefault("lfg_boards", {})[str(guild_id)] = data
+    save_config(config)
+
+
+def occupied_user_ids(lfg: dict) -> set[int]:
+    """Host always occupies a slot; reactors are unique across all roles."""
+    ids = {int(lfg["host_id"])}
+    for users in lfg.get("signups", {}).values():
+        ids.update(int(uid) for uid in users)
+    return ids
+
+
+def format_lfg_role_lines(lfg: dict) -> list[str]:
+    signups   = lfg.get("signups", {})
+    emoji_ids = lfg.get("emoji_ids", {})
+    lines = []
+    for role in lfg["roles"]:
+        eid = emoji_ids.get(role)
+        prefix = f"<:{role}:{eid}> {role}:" if eid else f"{role}:"
+        users = signups.get(role, [])
+        if users:
+            lines.append(f"{prefix} " + " ".join(f"<@{uid}>" for uid in users))
+        else:
+            lines.append(prefix)
+    return lines
+
+
+def build_lfg_text(lfg: dict) -> str:
+    occupied = occupied_user_ids(lfg)
+    lines = [
+        f"**{lfg['name']}**",
+        f"Host: <@{lfg['host_id']}>",
+        f"Time: <t:{lfg['unix_ts']}:F> (<t:{lfg['unix_ts']}:R>)",
+        "",
+        *format_lfg_role_lines(lfg),
+        "",
+        f"**Slots:** {len(occupied)}/{lfg['max_slots']}",
+    ]
+    return "\n".join(lines)
+
+
+def parse_lfg_datetime(date_str: str, time_str: str, tz_str: str) -> datetime:
+    date_str = date_str.strip()
+    time_str = " ".join(time_str.strip().upper().replace(".", "").split())
+    tz_str   = tz_str.strip()
+
+    parsed_date = None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d %b %Y", "%b %d %Y", "%d %B %Y", "%B %d %Y"):
+        try:
+            parsed_date = datetime.strptime(date_str, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed_date is None:
+        raise ValueError("Could not parse date. Use `YYYY-MM-DD` or `MM/DD/YYYY`.")
+
+    parsed_time = None
+    for fmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I %p", "%I:%M%p", "%I%p"):
+        try:
+            parsed_time = datetime.strptime(time_str, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed_time is None:
+        raise ValueError("Could not parse time. Use `20:00` or `8:00 PM`.")
+
+    alias = TZ_ALIASES.get(tz_str.upper())
+    try:
+        tz = ZoneInfo(alias) if alias else ZoneInfo(tz_str)
+    except ZoneInfoNotFoundError:
+        raise ValueError(
+            f"Unknown timezone `{tz_str}`. Try `EST`, `PST`, `UTC`, or an IANA name like `America/New_York`."
+        )
+
+    return datetime(
+        parsed_date.year, parsed_date.month, parsed_date.day,
+        parsed_time.hour, parsed_time.minute, parsed_time.second,
+        tzinfo=tz,
+    )
+
+
+def resolve_lfg_emojis(role_names: list[str]) -> dict[str, discord.Emoji]:
+    found: dict[str, discord.Emoji] = {}
+    missing: list[str] = []
+    for name in role_names:
+        emoji = None
+        for guild in bot.guilds:
+            emoji = discord.utils.get(guild.emojis, name=name)
+            if emoji:
+                break
+        if emoji:
+            found[name] = emoji
+        else:
+            missing.append(f":{name}:")
+    if missing:
+        raise ValueError(
+            "Missing custom emoji(s) the bot can use: " + ", ".join(missing)
+            + ". Add them to a server the bot is in and try again."
+        )
+    return found
 
 # ---------------------------------------------------------------------------
 # GW2 API — roster
@@ -448,214 +728,6 @@ def update_recently_left(cfg: dict, current_members: list) -> dict:
         join_dates.pop(name, None)
 
     return recently_left
-
-
-# ---------------------------------------------------------------------------
-# GW2 API — item cache (loads in background on startup)
-# ---------------------------------------------------------------------------
-
-async def build_item_cache():
-    global item_cache, item_cache_ready
-    logging.info("Building GW2 item cache...")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Get total page count
-            async with session.get(
-                "https://api.guildwars2.com/v2/items?page=0&page_size=200"
-            ) as resp:
-                resp.raise_for_status()
-                total_pages = int(resp.headers.get("X-Page-Total", 1))
-                first_page  = await resp.json()
-
-            all_items = list(first_page)
-
-            # Fetch remaining pages concurrently in batches of 10
-            sem = asyncio.Semaphore(10)
-
-            async def fetch_page(page_num):
-                async with sem:
-                    async with session.get(
-                        f"https://api.guildwars2.com/v2/items?page={page_num}&page_size=200"
-                    ) as r:
-                        if r.status == 200:
-                            return await r.json()
-                        return []
-
-            tasks_list = [fetch_page(p) for p in range(1, total_pages)]
-            results    = await asyncio.gather(*tasks_list, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, list):
-                    all_items.extend(result)
-
-        # Store only id and name, filter out items with no name
-        item_cache = [
-            {"id": item["id"], "name": item["name"]}
-            for item in all_items
-            if item.get("name")
-        ]
-        item_cache.sort(key=lambda x: x["name"])
-        item_cache_ready = True
-        logging.info(f"Item cache ready — {len(item_cache)} items loaded.")
-
-    except Exception as e:
-        logging.error(f"Failed to build item cache: {e}")
-
-
-async def fetch_item_details(item_id: int) -> dict | None:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            f"https://api.guildwars2.com/v2/items/{item_id}"
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None
-
-
-async def fetch_tp_prices(item_id: int) -> dict | None:
-    """Fetch trading post buy/sell prices for an item. Returns None if not tradable."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            f"https://api.guildwars2.com/v2/commerce/prices/{item_id}"
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return None  # 404 = not on trading post
-
-
-def search_items(query: str, limit: int = 25) -> list[dict]:
-    """Return up to `limit` items whose names contain the query (case-insensitive)."""
-    q = query.lower()
-    results = []
-    for item in item_cache:
-        if q in item["name"].lower():
-            results.append(item)
-            if len(results) >= limit:
-                break
-    return results
-
-# ---------------------------------------------------------------------------
-# Rarity colours for embeds
-# ---------------------------------------------------------------------------
-
-RARITY_COLORS = {
-    "Junk":       0xAAAAAA,
-    "Basic":      0xFFFFFF,
-    "Fine":       0x62A4DA,
-    "Masterwork": 0x1a9306,
-    "Rare":       0xFCD00B,
-    "Exotic":     0xFFA405,
-    "Ascended":   0xFF69B4,
-    "Legendary":  0x4C139D,
-}
-
-WIKI_BASE = "https://wiki.guildwars2.com/wiki/"
-
-def item_to_embed(item: dict, prices: dict | None = None) -> discord.Embed:
-    name     = item.get("name", "Unknown Item")
-    rarity   = item.get("rarity", "Basic")
-    itype    = item.get("type", "")
-    desc     = item.get("description", "")
-    icon_url = item.get("icon", "")
-    level    = item.get("level", 0)
-    vendor   = item.get("vendor_value", 0)
-
-    color = RARITY_COLORS.get(rarity, 0xFFFFFF)
-    embed = discord.Embed(title=name, color=color)
-
-    # Type and rarity
-    embed.add_field(name="Rarity", value=rarity, inline=True)
-    if itype:
-        subtype = item.get("details", {}).get("type", "")
-        type_str = f"{itype} — {subtype}" if subtype else itype
-        embed.add_field(name="Type", value=type_str, inline=True)
-    if level:
-        embed.add_field(name="Required Level", value=str(level), inline=True)
-
-    # Description / flavour text
-    if desc:
-        # Strip GW2 colour tags like <c=@flavour>...</c>
-        import re
-        clean_desc = re.sub(r"<[^>]+>", "", desc)
-        if clean_desc:
-            embed.add_field(name="Description", value=clean_desc[:1024], inline=False)
-
-    # Stats (weapons/armour)
-    details = item.get("details", {})
-    attributes = details.get("infix_upgrade", {}).get("attributes", [])
-    if attributes:
-        stats_str = "\n".join(f"+{a['modifier']} {a['attribute']}" for a in attributes)
-        embed.add_field(name="Stats", value=stats_str, inline=False)
-
-    # Defense (armour)
-    defense = details.get("defense")
-    if defense:
-        embed.add_field(name="Defense", value=str(defense), inline=True)
-
-    # Damage (weapons)
-    min_power = details.get("min_power")
-    max_power = details.get("max_power")
-    if min_power and max_power:
-        embed.add_field(name="Damage", value=f"{min_power}–{max_power}", inline=True)
-
-    # Vendor value (convert copper to g/s/c)
-    if vendor:
-        gold   = vendor // 10000
-        silver = (vendor % 10000) // 100
-        copper = vendor % 100
-        parts  = []
-        if gold:   parts.append(f"{gold}g")
-        if silver: parts.append(f"{silver}s")
-        if copper: parts.append(f"{copper}c")
-        embed.add_field(name="Vendor Value", value=" ".join(parts) or "0c", inline=True)
-
-    # Trading post prices
-    if prices:
-        def fmt_copper(copper: int) -> str:
-            gold   = copper // 10000
-            silver = (copper % 10000) // 100
-            c      = copper % 100
-            parts  = []
-            if gold:   parts.append(f"{gold}g")
-            if silver: parts.append(f"{silver}s")
-            if c:      parts.append(f"{c}c")
-            return " ".join(parts) or "0c"
-
-        sells = prices.get("sells", {})
-        buys  = prices.get("buys", {})
-        sell_price = sells.get("unit_price", 0)
-        buy_price  = buys.get("unit_price", 0)
-        sell_qty   = sells.get("quantity", 0)
-        buy_qty    = buys.get("quantity", 0)
-
-        if sell_price:
-            embed.add_field(
-                name="Sell (lowest offer)",
-                value=f"{fmt_copper(sell_price)}\n_{sell_qty:,} listed_",
-                inline=True
-            )
-        if buy_price:
-            embed.add_field(
-                name="Buy (highest bid)",
-                value=f"{fmt_copper(buy_price)}\n_{buy_qty:,} orders_",
-                inline=True
-            )
-
-    # Icon
-    if icon_url:
-        embed.set_thumbnail(url=icon_url)
-
-    # Wiki link
-    wiki_name = name.replace(" ", "_")
-    embed.add_field(
-        name="Wiki",
-        value=f"[{name} on the GW2 Wiki]({WIKI_BASE}{wiki_name})",
-        inline=False
-    )
-
-    embed.set_footer(text=f"Item ID: {item.get('id', '?')} • {rarity}")
-    return embed
 
 # ---------------------------------------------------------------------------
 # Roster helpers
@@ -957,6 +1029,673 @@ class AnonymityChoiceView(discord.ui.View):
         )
 
 # ---------------------------------------------------------------------------
+# LFG views
+# ---------------------------------------------------------------------------
+
+class LfgDetailsModal(discord.ui.Modal, title="Create LFG"):
+    event_name = discord.ui.TextInput(
+        label="Event name",
+        placeholder="e.g. Friday Raid, HT CM, WvW zerg",
+        max_length=100,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = LfgWhenView(name=self.event_name.value.strip())
+        await interaction.response.send_message(view.content(), view=view, ephemeral=True)
+
+
+class LfgWhenView(discord.ui.View):
+    """Click-only date / time / timezone picker (no typing)."""
+
+    DATES_PER_PAGE = 25   # Discord select menus hold at most 25 options
+    MAX_DATE_PAGES = 12   # ~300 days ahead
+    SLOTS_PER_PAGE = 24   # 24 x 15 min = 6 hours per page
+    TIME_PAGES     = 4    # 4 x 6 hours = full day
+
+    def __init__(self, name: str):
+        super().__init__(timeout=300)
+        self.name       = name
+        self.tz:        str | None = None
+        self.date                  = None      # datetime.date
+        self.slot:      int | None = None      # minutes since midnight
+        self.date_page: int = 0
+        self.time_page: int = 3                # start on the 6 PM - midnight page
+        self._refresh()
+
+    # ----- helpers -----------------------------------------------------
+
+    def _today(self):
+        tz = ZoneInfo(self.tz) if self.tz else ZoneInfo("UTC")
+        return datetime.now(tz).date()
+
+    @staticmethod
+    def _fmt_date(d) -> str:
+        return f"{d:%a %b} {d.day}, {d.year}"
+
+    @staticmethod
+    def _fmt_slot(minutes: int) -> str:
+        h, m = divmod(minutes, 60)
+        return f"{h % 12 or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+    @staticmethod
+    def _utc_offset(tz_name: str) -> str:
+        off = datetime.now(ZoneInfo(tz_name)).utcoffset()
+        total = int(off.total_seconds() // 60)
+        sign = "+" if total >= 0 else "-"
+        h, m = divmod(abs(total), 60)
+        return f"Currently UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+    def content(self) -> str:
+        date_s = self._fmt_date(self.date) if self.date else "—"
+        time_s = self._fmt_slot(self.slot) if self.slot is not None else "—"
+        tz_s   = LFG_TZ_LABELS.get(self.tz, "—") if self.tz else "—"
+        return (
+            f"**{self.name}** — pick when it starts.\n"
+            f"🌍 Timezone: **{tz_s}**\n"
+            f"📅 Date: **{date_s}**\n"
+            f"🕒 Time: **{time_s}**\n"
+            "-# Choose your timezone first so the date list starts from your \"today\"."
+        )
+
+    def _refresh(self):
+        """Rebuild option lists (with defaults) and button states from current state."""
+        # Timezone
+        self.tz_select.options = [
+            discord.SelectOption(
+                label=label,
+                value=value,
+                description=self._utc_offset(value),
+                default=(value == self.tz),
+            )
+            for label, value in LFG_TZ_CHOICES
+        ]
+
+        # Dates (25 per page, starting from "today" in the chosen timezone)
+        today = self._today()
+        base  = today + timedelta(days=self.date_page * self.DATES_PER_PAGE)
+        date_opts = []
+        for i in range(self.DATES_PER_PAGE):
+            d = base + timedelta(days=i)
+            label = self._fmt_date(d)
+            if d == today:
+                label += " (today)"
+            elif d == today + timedelta(days=1):
+                label += " (tomorrow)"
+            date_opts.append(
+                discord.SelectOption(
+                    label=label,
+                    value=d.isoformat(),
+                    default=(self.date is not None and d == self.date),
+                )
+            )
+        self.date_select.options = date_opts
+        self.date_select.placeholder = (
+            f"📅 Date ({self._fmt_date(base)} – "
+            f"{self._fmt_date(base + timedelta(days=self.DATES_PER_PAGE - 1))})"
+        )
+
+        # Time (15-minute slots, 6 hours per page)
+        start = self.time_page * self.SLOTS_PER_PAGE * 15
+        slots = [start + 15 * i for i in range(self.SLOTS_PER_PAGE)]
+        self.time_select.options = [
+            discord.SelectOption(
+                label=self._fmt_slot(s), value=str(s), default=(self.slot == s)
+            )
+            for s in slots
+        ]
+        self.time_select.placeholder = (
+            f"🕒 Time ({self._fmt_slot(slots[0])} – {self._fmt_slot(slots[-1])})"
+        )
+
+        # Buttons
+        self.prev_dates.disabled = self.date_page <= 0
+        self.next_dates.disabled = self.date_page >= self.MAX_DATE_PAGES - 1
+        self.prev_times.disabled = self.time_page <= 0
+        self.next_times.disabled = self.time_page >= self.TIME_PAGES - 1
+        self.confirm_button.disabled = not (self.date and self.slot is not None and self.tz)
+
+    async def _update(self, interaction: discord.Interaction):
+        self._refresh()
+        await interaction.response.edit_message(content=self.content(), view=self)
+
+    # ----- components --------------------------------------------------
+
+    @discord.ui.select(placeholder="🌍 Timezone", min_values=1, max_values=1, options=[], row=0)
+    async def tz_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.tz = select.values[0]
+        await self._update(interaction)
+
+    @discord.ui.select(placeholder="📅 Date", min_values=1, max_values=1, options=[], row=1)
+    async def date_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.date = datetime.strptime(select.values[0], "%Y-%m-%d").date()
+        await self._update(interaction)
+
+    @discord.ui.select(placeholder="🕒 Time", min_values=1, max_values=1, options=[], row=2)
+    async def time_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.slot = int(select.values[0])
+        await self._update(interaction)
+
+    @discord.ui.button(label="◀ Dates", style=discord.ButtonStyle.secondary, row=3)
+    async def prev_dates(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.date_page = max(0, self.date_page - 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="Dates ▶", style=discord.ButtonStyle.secondary, row=3)
+    async def next_dates(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.date_page = min(self.MAX_DATE_PAGES - 1, self.date_page + 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="◀ Times", style=discord.ButtonStyle.secondary, row=3)
+    async def prev_times(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.time_page = max(0, self.time_page - 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="Times ▶", style=discord.ButtonStyle.secondary, row=3)
+    async def next_times(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.time_page = min(self.TIME_PAGES - 1, self.time_page + 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, row=4, disabled=True)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (self.date and self.slot is not None and self.tz):
+            await interaction.response.send_message(
+                "❌ Pick a date, time, and timezone first.", ephemeral=True
+            )
+            return
+
+        hour, minute = divmod(self.slot, 60)
+        dt = datetime(
+            self.date.year, self.date.month, self.date.day,
+            hour, minute,
+            tzinfo=ZoneInfo(self.tz),
+        )
+        if dt.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            await interaction.response.send_message(
+                "❌ That time is already in the past. Pick a later date or time.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                f"**{self.name}** at {discord.utils.format_dt(dt, style='F')}.\n"
+                "How many people is this for?"
+            ),
+            view=LfgSizeView(
+                name=self.name,
+                unix_ts=int(dt.timestamp()),
+            ),
+        )
+        self.stop()
+
+
+class LfgSizeView(discord.ui.View):
+    def __init__(self, name: str, unix_ts: int):
+        super().__init__(timeout=180)
+        self.name       = name
+        self.unix_ts    = unix_ts
+
+    async def _ask_roles(self, interaction: discord.Interaction, max_slots: int, *, edit: bool):
+        view = LfgRolesView(
+            name=self.name,
+            unix_ts=self.unix_ts,
+            max_slots=max_slots,
+        )
+        content = (
+            f"Party size: **{max_slots}**.\n"
+            "Use standard squad roles (`dps`, `qdps`, `adps`, `qheal`, `aheal`, `flex`), "
+            "or DPS only?"
+        )
+        if edit:
+            await interaction.response.edit_message(content=content, view=view)
+        else:
+            await interaction.response.send_message(content=content, view=view, ephemeral=True)
+
+    @discord.ui.button(label="5 person", style=discord.ButtonStyle.primary)
+    async def size_five(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ask_roles(interaction, 5, edit=True)
+
+    @discord.ui.button(label="10 person", style=discord.ButtonStyle.primary)
+    async def size_ten(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._ask_roles(interaction, 10, edit=True)
+
+    @discord.ui.button(label="Custom", style=discord.ButtonStyle.secondary)
+    async def size_custom(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            LfgCustomSizeModal(name=self.name, unix_ts=self.unix_ts)
+        )
+
+
+class LfgCustomSizeModal(discord.ui.Modal, title="Custom party size"):
+    def __init__(self, name: str, unix_ts: int):
+        super().__init__()
+        self.name       = name
+        self.unix_ts    = unix_ts
+
+    amount = discord.ui.TextInput(
+        label="Number of people (1–50)",
+        placeholder="e.g. 15",
+        max_length=2,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.amount.value.strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("❌ Enter a whole number from 1 to 50.", ephemeral=True)
+            return
+        max_slots = int(raw)
+        if not 1 <= max_slots <= LFG_MAX_CUSTOM:
+            await interaction.response.send_message("❌ Party size must be between 1 and 50.", ephemeral=True)
+            return
+
+        view = LfgRolesView(
+            name=self.name,
+            unix_ts=self.unix_ts,
+            max_slots=max_slots,
+        )
+        await interaction.response.send_message(
+            f"Party size: **{max_slots}**.\n"
+            "Use standard squad roles (`dps`, `qdps`, `adps`, `qheal`, `aheal`, `flex`), "
+            "or DPS only?",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class LfgRolesView(discord.ui.View):
+    def __init__(self, name: str, unix_ts: int, max_slots: int):
+        super().__init__(timeout=180)
+        self.name      = name
+        self.unix_ts   = unix_ts
+        self.max_slots = max_slots
+        self._posted   = False
+
+    async def _post(self, interaction: discord.Interaction, standard: bool):
+        if self._posted:
+            await interaction.response.send_message("This LFG was already created.", ephemeral=True)
+            return
+        self._posted = True
+
+        await interaction.response.edit_message(content="Creating LFG…", view=None)
+
+        guild_id = interaction.guild_id
+        board = get_lfg_board(guild_id) if guild_id else None
+        if not board:
+            await interaction.edit_original_response(
+                content="❌ LFG isn't set up on this server. Ask an admin to run `/setuplfg`."
+            )
+            return
+
+        roles = LFG_STANDARD_ROLES if standard else LFG_SIMPLE_ROLES
+        try:
+            emojis = resolve_lfg_emojis(roles)
+        except ValueError as e:
+            self._posted = False
+            await interaction.edit_original_response(content=f"❌ {e}")
+            return
+
+        calendar_full = False
+        async with get_lfg_lock():
+            if len(get_guild_lfgs(guild_id)) >= LFG_BOARD_MAX:
+                calendar_full = True
+            else:
+                lfg_id = secrets.token_hex(4)
+                lfg = {
+                    "id":        lfg_id,
+                    "host_id":   interaction.user.id,
+                    "name":      self.name,
+                    "unix_ts":   self.unix_ts,
+                    "max_slots": self.max_slots,
+                    "roles":     roles,
+                    "signups":   {role: [] for role in roles},
+                    "emoji_ids": {role: emoji.id for role, emoji in emojis.items()},
+                }
+                save_lfg(guild_id, lfg_id, lfg)
+
+        if calendar_full:
+            await interaction.edit_original_response(
+                content=f"❌ The calendar is full ({LFG_BOARD_MAX} active LFGs). Try again once one has started."
+            )
+            return
+
+        await refresh_lfg_board(guild_id)
+        await interaction.edit_original_response(
+            content=f"✅ **{self.name}** is on the calendar in <#{board['channel_id']}>."
+        )
+        logging.info(
+            f"User {interaction.user.id} created LFG '{self.name}' (id {lfg_id}, "
+            f"{self.max_slots} slots, roles={roles}) in guild {guild_id}"
+        )
+
+    @discord.ui.button(label="Standard squad roles", style=discord.ButtonStyle.success)
+    async def standard_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._post(interaction, standard=True)
+
+    @discord.ui.button(label="DPS only", style=discord.ButtonStyle.secondary)
+    async def dps_only(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._post(interaction, standard=False)
+
+
+# ---------------------------------------------------------------------------
+# LFG calendar, "Create LFG" button, and per-LFG detail view
+# ---------------------------------------------------------------------------
+
+def _lfg_user_current_role(lfg: dict, user_id: int) -> str | None:
+    for role, users in lfg.get("signups", {}).items():
+        if any(int(uid) == user_id for uid in users):
+            return role
+    return None
+
+
+def _can_delete_lfg(lfg: dict, user) -> bool:
+    """The host can delete their own LFG; server administrators can delete any."""
+    perms = getattr(user, "guild_permissions", None)
+    return int(lfg["host_id"]) == user.id or bool(perms and perms.administrator)
+
+
+def _lfg_option_description(lfg: dict) -> str:
+    dt = datetime.fromtimestamp(int(lfg["unix_ts"]), tz=timezone.utc)
+    slots = f"{len(occupied_user_ids(lfg))}/{lfg['max_slots']} slots"
+    return f"{dt:%a %b} {dt.day}, {dt:%H:%M} UTC · {slots}"[:100]
+
+
+def build_lfg_board_embed(entries: list[tuple[str, dict]]) -> discord.Embed:
+    """The 'calendar': every active LFG in chronological order."""
+    embed = discord.Embed(title="📅 Upcoming LFGs", color=0x5865F2)
+    if not entries:
+        embed.description = "No LFGs scheduled right now.\nClick **Create LFG** above to start one."
+        return embed
+
+    embed.description = "Pick an LFG from the dropdown below to view it and join with a role."
+    for _lfg_id, lfg in entries[:LFG_BOARD_MAX]:
+        occupied = occupied_user_ids(lfg)
+        embed.add_field(
+            name=lfg["name"][:100],
+            value=(
+                f"🕒 <t:{lfg['unix_ts']}:F> (<t:{lfg['unix_ts']}:R>)\n"
+                f"👤 <@{lfg['host_id']}> · **{len(occupied)}/{lfg['max_slots']}** slots"
+            ),
+            inline=False,
+        )
+    return embed
+
+
+def build_lfg_detail_text(lfg: dict, user_id: int) -> str:
+    current = _lfg_user_current_role(lfg, user_id)
+    if current:
+        status = f"✅ You're signed up as **{current}**."
+    elif int(lfg["host_id"]) == user_id:
+        status = "You're the host, so a slot is reserved for you. Pick a role to list yourself under it."
+    else:
+        status = "Pick a role below to join."
+    return f"{build_lfg_text(lfg)}\n\n{status}"
+
+
+class LfgCreateView(discord.ui.View):
+    """Persistent 'Create LFG' button posted by /setuplfg."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Create LFG",
+        style=discord.ButtonStyle.success,
+        emoji="➕",
+        custom_id="lfg_create",
+    )
+    async def create_lfg(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild_id or not get_lfg_board(interaction.guild_id):
+            await interaction.response.send_message(
+                "❌ LFG isn't set up on this server. Ask an admin to run `/setuplfg`.",
+                ephemeral=True,
+            )
+            return
+        if len(get_guild_lfgs(interaction.guild_id)) >= LFG_BOARD_MAX:
+            await interaction.response.send_message(
+                f"❌ The calendar is full ({LFG_BOARD_MAX} active LFGs). Try again once one has started.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(LfgDetailsModal())
+
+
+class LfgBoardSelect(discord.ui.Select):
+    """Dropdown under the calendar; one option per active LFG."""
+
+    def __init__(self, entries: list[tuple[str, dict]]):
+        options = [
+            discord.SelectOption(
+                label=lfg["name"][:100],
+                value=lfg_id,
+                description=_lfg_option_description(lfg),
+            )
+            for lfg_id, lfg in entries[:LFG_BOARD_MAX]
+        ]
+        if not options:
+            # Only used when registering the persistent view at startup.
+            options = [discord.SelectOption(label="No LFGs", value="none")]
+        super().__init__(
+            custom_id="lfg_board_select",
+            placeholder="📅 Select an LFG to view or join…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+        lfg_id   = self.values[0]
+        lfg      = get_lfg(guild_id, lfg_id) if guild_id else None
+
+        if not lfg:
+            await interaction.response.send_message(
+                "❌ That LFG no longer exists (it may have started or been deleted).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                build_lfg_detail_text(lfg, interaction.user.id),
+                view=LfgDetailView(lfg_id, lfg, interaction.user),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        # Re-render the calendar: resets the dropdown selection and drops stale entries.
+        if guild_id:
+            asyncio.create_task(refresh_lfg_board(guild_id))
+
+
+class LfgBoardView(discord.ui.View):
+    """Persistent view holding the calendar dropdown."""
+
+    def __init__(self, entries: list[tuple[str, dict]] | None = None):
+        super().__init__(timeout=None)
+        self.add_item(LfgBoardSelect(entries or []))
+
+
+class LfgRoleButton(discord.ui.Button):
+    def __init__(self, role: str, selected: bool, emoji_id, row: int):
+        super().__init__(
+            label=role,
+            style=discord.ButtonStyle.success if selected else discord.ButtonStyle.secondary,
+            emoji=discord.PartialEmoji(name=role, id=int(emoji_id)) if emoji_id else None,
+            row=row,
+        )
+        self.role = role
+
+    async def callback(self, interaction: discord.Interaction):
+        await lfg_signup(interaction, self.view.lfg_id, self.role)
+
+
+class LfgLeaveButton(discord.ui.Button):
+    def __init__(self, row: int, disabled: bool):
+        super().__init__(label="Leave", style=discord.ButtonStyle.secondary, row=row, disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        await lfg_signup(interaction, self.view.lfg_id, None)
+
+
+class LfgDeleteButton(discord.ui.Button):
+    def __init__(self, row: int):
+        super().__init__(label="Delete LFG", style=discord.ButtonStyle.danger, emoji="🗑️", row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        lfg = get_lfg(interaction.guild_id, self.view.lfg_id)
+        if not lfg:
+            await interaction.response.edit_message(
+                content="❌ That LFG no longer exists (it may have started or been deleted).",
+                view=None,
+            )
+            return
+        if not _can_delete_lfg(lfg, interaction.user):
+            await interaction.response.send_message(
+                "❌ Only the host (or a server admin) can delete this LFG.", ephemeral=True
+            )
+            return
+
+        host_id = int(lfg["host_id"])
+        others = {
+            int(uid)
+            for users in lfg.get("signups", {}).values()
+            for uid in users
+            if int(uid) != host_id
+        }
+        warning = (
+            f" This will remove **{len(others)}** signed-up "
+            f"member{'s' if len(others) != 1 else ''} from it."
+            if others else ""
+        )
+        await interaction.response.edit_message(
+            content=f"🗑️ Delete **{lfg['name']}**?{warning} This can't be undone.",
+            view=LfgDeleteConfirmView(self.view.lfg_id),
+        )
+
+
+class LfgDetailView(discord.ui.View):
+    """Ephemeral view shown to one user after they pick an LFG from the calendar."""
+
+    def __init__(self, lfg_id: str, lfg: dict, user):
+        super().__init__(timeout=600)
+        self.lfg_id = lfg_id
+
+        current   = _lfg_user_current_role(lfg, user.id)
+        emoji_ids = lfg.get("emoji_ids", {})
+        roles     = lfg["roles"]
+        for i, role in enumerate(roles):
+            self.add_item(LfgRoleButton(role, current == role, emoji_ids.get(role), row=i // 5))
+
+        action_row = (len(roles) - 1) // 5 + 1
+        self.add_item(LfgLeaveButton(row=action_row, disabled=current is None))
+        if _can_delete_lfg(lfg, user):
+            self.add_item(LfgDeleteButton(row=action_row))
+
+
+class LfgDeleteConfirmView(discord.ui.View):
+    def __init__(self, lfg_id: str):
+        super().__init__(timeout=120)
+        self.lfg_id = lfg_id
+
+    @discord.ui.button(label="Yes, delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild_id
+        lfg      = None
+        denied   = False
+        async with get_lfg_lock():
+            lfg = get_lfg(guild_id, self.lfg_id)
+            if lfg and not _can_delete_lfg(lfg, interaction.user):
+                denied = True
+            elif lfg:
+                delete_lfg(guild_id, self.lfg_id)
+
+        if denied:
+            await interaction.response.send_message(
+                "❌ Only the host (or a server admin) can delete this LFG.", ephemeral=True
+            )
+            return
+        if not lfg:
+            await interaction.response.edit_message(
+                content="❌ That LFG no longer exists (it may have started or been deleted).",
+                view=None,
+            )
+            await refresh_lfg_board(guild_id)
+            return
+
+        await interaction.response.edit_message(content=f"🗑️ **{lfg['name']}** was deleted.", view=None)
+        await refresh_lfg_board(guild_id)
+        logging.info(f"User {interaction.user.id} deleted LFG '{lfg['name']}' ({self.lfg_id}) in guild {guild_id}")
+
+    @discord.ui.button(label="Keep it", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lfg = get_lfg(interaction.guild_id, self.lfg_id)
+        if not lfg:
+            await interaction.response.edit_message(
+                content="❌ That LFG no longer exists (it may have started or been deleted).",
+                view=None,
+            )
+            return
+        await interaction.response.edit_message(
+            content=build_lfg_detail_text(lfg, interaction.user.id),
+            view=LfgDetailView(self.lfg_id, lfg, interaction.user),
+        )
+
+
+async def lfg_signup(interaction: discord.Interaction, lfg_id: str, role: str | None):
+    """Join `role` on an LFG, or leave it when role is None. Updates the detail view and the calendar."""
+    guild_id = interaction.guild_id
+    user_id  = interaction.user.id
+    lfg      = None
+    notice   = None
+    changed  = False
+
+    async with get_lfg_lock():
+        lfg = get_lfg(guild_id, lfg_id)
+        if lfg is None:
+            pass
+        elif int(lfg["unix_ts"]) <= datetime.now(timezone.utc).timestamp():
+            notice = "❌ This LFG has already started."
+        else:
+            signups = lfg.setdefault("signups", {r: [] for r in lfg["roles"]})
+            current = _lfg_user_current_role(lfg, user_id)
+
+            if role is None:
+                if current:
+                    signups[current] = [u for u in signups[current] if int(u) != user_id]
+                    changed = True
+            elif current != role:
+                occupied = occupied_user_ids(lfg)   # the host always occupies a slot
+                if user_id not in occupied and len(occupied) >= int(lfg["max_slots"]):
+                    notice = "❌ This LFG is full."
+                else:
+                    if current:
+                        signups[current] = [u for u in signups[current] if int(u) != user_id]
+                    signups.setdefault(role, []).append(user_id)
+                    changed = True
+
+            if changed:
+                lfg["signups"] = signups
+                save_lfg(guild_id, lfg_id, lfg)
+
+    if lfg is None:
+        await interaction.response.edit_message(
+            content="❌ That LFG no longer exists (it may have started or been deleted).",
+            view=None,
+        )
+        await refresh_lfg_board(guild_id)
+        return
+
+    content = build_lfg_detail_text(lfg, user_id)
+    if notice:
+        content += f"\n\n{notice}"
+    await interaction.response.edit_message(
+        content=content,
+        view=LfgDetailView(lfg_id, lfg, interaction.user),
+    )
+    if changed:
+        await refresh_lfg_board(guild_id)
+
+# ---------------------------------------------------------------------------
 # Post or edit roster message
 # ---------------------------------------------------------------------------
 
@@ -1111,6 +1850,7 @@ async def sync_verifications(discord_guild: discord.Guild, cfg: dict, members: l
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True  # needed to detect non-command messages
+intents.reactions = True
 bot  = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -1162,14 +1902,17 @@ async def on_ready():
     migrate_date_formats()
     bot.add_view(RosterView())
     bot.add_view(ReportView())
+    bot.add_view(LfgCreateView())
+    bot.add_view(LfgBoardView())
     await tree.sync()
     logging.info(f"Logged in as {bot.user} ({bot.user.id})")
     if not roster_loop.is_running():
         roster_loop.start()
-    # Build item cache in background — bot is usable immediately
-    asyncio.create_task(build_item_cache())
+    if not lfg_loop.is_running():
+        lfg_loop.start()
     # Clean up verified accounts for members who left while the bot was offline
     asyncio.create_task(_cleanup_departed_members())
+    asyncio.create_task(_lfg_startup())
 
 
 async def _cleanup_departed_members():
@@ -1271,6 +2014,166 @@ async def _autodelete(message: discord.Message):
                 )
 
 # ---------------------------------------------------------------------------
+# LFG calendar refresh and start announcements
+# ---------------------------------------------------------------------------
+
+_lfg_board_locks: dict[int, asyncio.Lock] = {}
+
+
+async def _get_channel(channel_id: int):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    return channel
+
+
+async def refresh_lfg_board(guild_id: int):
+    """Re-render the calendar message (embed + dropdown) from the stored LFGs."""
+    lock = _lfg_board_locks.setdefault(guild_id, asyncio.Lock())
+    async with lock:
+        board = get_lfg_board(guild_id)
+        if not board:
+            return
+        channel = await _get_channel(board["channel_id"])
+        if channel is None:
+            logging.warning(f"LFG calendar channel {board['channel_id']} not found in guild {guild_id}")
+            return
+
+        # Snapshot taken inside the per-guild lock, so a slow edit can never
+        # overwrite a newer one with stale data.
+        entries = sorted_lfg_entries(guild_id)
+        embed   = build_lfg_board_embed(entries)
+        view    = LfgBoardView(entries) if entries else None
+
+        try:
+            await channel.get_partial_message(board["board_message_id"]).edit(embed=embed, view=view)
+        except discord.NotFound:
+            # Someone deleted the calendar message: post a fresh one.
+            try:
+                msg = await channel.send(embed=embed, view=view)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                logging.warning(f"Could not repost LFG calendar in guild {guild_id}: {e}")
+                return
+            board["board_message_id"] = msg.id
+            set_lfg_board(guild_id, board)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logging.warning(f"Could not update LFG calendar in guild {guild_id}: {e}")
+
+
+async def refresh_all_lfg_boards():
+    for guild_id_str in list(load_config().get("lfg_boards", {}).keys()):
+        if guild_id_str.isdigit():
+            await refresh_lfg_board(int(guild_id_str))
+
+
+async def _announce_channel_for(guild_id: int):
+    board = get_lfg_board(guild_id)
+    if not board:
+        return None
+    channel = await _get_channel(board["announce_channel_id"])
+    if channel is None:
+        logging.warning(f"LFG announce channel {board['announce_channel_id']} not found in guild {guild_id}; using calendar channel")
+        channel = await _get_channel(board["channel_id"])
+    return channel
+
+
+async def announce_lfg_start(guild_id: int, lfg: dict):
+    channel = await _announce_channel_for(guild_id)
+    if channel is None:
+        logging.warning(f"LFG '{lfg.get('name')}' started in guild {guild_id} but no channel to announce in")
+        return
+
+    role_block = "\n".join(format_lfg_role_lines(lfg))
+    try:
+        await channel.send(
+            f"**{lfg['name']}** is starting now!\n"
+            f"Host: <@{lfg['host_id']}>\n\n"
+            f"{role_block}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"Could not send LFG start message for '{lfg.get('name')}': {e}")
+        return
+
+    logging.info(f"LFG '{lfg['name']}' started in guild {guild_id}")
+
+
+async def process_due_lfgs():
+    now = datetime.now(timezone.utc).timestamp()
+    due: list[tuple[int, str, dict]] = []
+    async with get_lfg_lock():
+        config = load_config()
+        for guild_id_str, lfgs in list(config.get("lfgs", {}).items()):
+            if not guild_id_str.isdigit():
+                continue
+            for lfg_id, lfg in list(lfgs.items()):
+                if int(lfg.get("unix_ts", 0)) <= now:
+                    due.append((int(guild_id_str), lfg_id, lfg))
+                    delete_lfg(int(guild_id_str), lfg_id)
+
+    touched: set[int] = set()
+    for guild_id, lfg_id, lfg in due:
+        touched.add(guild_id)
+        try:
+            await announce_lfg_start(guild_id, lfg)
+        except Exception as e:
+            logging.error(f"Failed to start LFG {lfg_id} in guild {guild_id}: {e}")
+
+    for guild_id in touched:
+        try:
+            await refresh_lfg_board(guild_id)
+        except Exception as e:
+            logging.error(f"Failed to refresh LFG calendar in guild {guild_id}: {e}")
+
+
+async def migrate_legacy_lfgs():
+    """
+    LFGs created before the calendar existed were keyed by their message id and
+    carried a channel_id. Re-key them by a plain id, keep their signups, and
+    delete the old posts so they show up on the calendar instead.
+    """
+    to_delete: list[tuple[int, int]] = []
+    touched: set[int] = set()
+    async with get_lfg_lock():
+        config = load_config()
+        for guild_id_str, lfgs in config.get("lfgs", {}).items():
+            if not guild_id_str.isdigit():
+                continue
+            for key, lfg in lfgs.items():
+                if isinstance(lfg, dict) and "id" not in lfg:
+                    channel_id = lfg.pop("channel_id", None)
+                    lfg["id"] = key
+                    if channel_id and key.isdigit():
+                        to_delete.append((int(channel_id), int(key)))
+                    touched.add(int(guild_id_str))
+        if touched:
+            save_config(config)
+
+    for channel_id, message_id in to_delete:
+        channel = await _get_channel(channel_id)
+        if channel is None:
+            continue
+        try:
+            await channel.get_partial_message(message_id).delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    if touched:
+        logging.info(f"Migrated legacy LFGs in {len(touched)} guild(s) to the calendar format.")
+
+
+async def _lfg_startup():
+    try:
+        await migrate_legacy_lfgs()
+        await refresh_all_lfg_boards()
+    except Exception as e:
+        logging.error(f"LFG startup tasks failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # /setup
 # ---------------------------------------------------------------------------
 
@@ -1355,9 +2258,13 @@ async def setup(
 # /verify
 # ---------------------------------------------------------------------------
 
-@tree.command(name="verify", description="Verify your GW2 account to receive your guild rank role.")
-@app_commands.describe(gw2_username="Your full GW2 account name, including the numbers (e.g. PlayerName.1234)")
-async def verify(interaction: discord.Interaction, gw2_username: str):
+VERIFY_INSTRUCTIONS = (
+    "Use your full Guild Wars 2 account name (including the numbers, e.g. PlayerName.1234) "
+    "to gain access to the server. **This is case sensitive.**"
+)
+
+
+async def verify_gw2_account(interaction: discord.Interaction, gw2_username: str):
     await interaction.response.defer(ephemeral=True)
 
     cfg = get_guild_config(interaction.guild_id)
@@ -1427,6 +2334,41 @@ async def verify(interaction: discord.Interaction, gw2_username: str):
         f"and your server nickname has been updated.",
         ephemeral=True
     )
+
+
+class VerifyModal(discord.ui.Modal, title="Verify your GW2 account"):
+    def __init__(self):
+        super().__init__()
+        self.gw2_name = discord.ui.TextInput(
+            placeholder="e.g. PlayerName.1234 (include the numbers)",
+            max_length=50,
+            required=True,
+            **({} if hasattr(discord.ui, "Label") else {"label": "Full GW2 account name (case sensitive)"}),
+        )
+        if hasattr(discord.ui, "Label") and hasattr(discord.ui, "TextDisplay"):
+            # discord.py 2.6+: instructions above the box, input wrapped in a Label.
+            self.add_item(discord.ui.TextDisplay(VERIFY_INSTRUCTIONS))
+            self.add_item(discord.ui.Label(
+                text="Full GW2 account name (case sensitive)",
+                component=self.gw2_name,
+            ))
+        else:
+            # Older discord.py: the label and placeholder carry the key points on their own.
+            self.add_item(self.gw2_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await verify_gw2_account(interaction, self.gw2_name.value)
+
+
+@tree.command(name="verify", description="Verify your GW2 account to receive your guild rank role.")
+async def verify(interaction: discord.Interaction):
+    if not interaction.guild_id or not get_guild_config(interaction.guild_id):
+        await interaction.response.send_message(
+            "❌ This bot has not been set up yet. An admin needs to run `/setup` first.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_modal(VerifyModal())
 
 # ---------------------------------------------------------------------------
 # /forceverify  — admin only, verify another user manually
@@ -1505,69 +2447,6 @@ async def forceverify(interaction: discord.Interaction, member: discord.Member, 
         ephemeral=True
     )
 
-
-# ---------------------------------------------------------------------------
-# /item  — search GW2 items with autocomplete
-# ---------------------------------------------------------------------------
-
-@tree.command(name="item", description="Search for a GW2 item and view its details.")
-@app_commands.describe(name="Start typing an item name to search")
-async def item_search(interaction: discord.Interaction, name: str):
-    # Check guest role before deferring so ephemeral state is set correctly
-    item_cfg = get_guild_config(interaction.guild_id)
-    guest_role_name = get_guest_role_name(item_cfg) if item_cfg else "Guest"
-    guest_role = discord.utils.get(interaction.guild.roles, name=guest_role_name)
-    if guest_role and guest_role in interaction.user.roles:
-        await interaction.response.send_message(
-            "❌ You need to verify your GW2 account first. Use `/verify` to get access.",
-            ephemeral=True
-        )
-        return
-
-    # Defer publicly — result will be visible to everyone in the channel
-    await interaction.response.defer(ephemeral=False)
-
-    if not item_cache_ready:
-        await interaction.followup.send("⏳ Item database is still loading, please try again in a moment.", ephemeral=True)
-        return
-
-    item_id   = None
-    item_data = None
-
-    if "|" in name:
-        parts = name.rsplit("|", 1)
-        try:
-            item_id   = int(parts[1])
-            item_data = await fetch_item_details(item_id)
-        except (ValueError, IndexError):
-            pass
-
-    if item_data is None:
-        matches = search_items(name, limit=1)
-        if not matches:
-            await interaction.followup.send(f"❌ No items found matching **{name}**.", ephemeral=True)
-            return
-        item_data = await fetch_item_details(matches[0]["id"])
-
-    if item_data is None:
-        await interaction.followup.send("❌ Could not fetch item details. Try again in a moment.", ephemeral=True)
-        return
-
-    prices = await fetch_tp_prices(item_data["id"])
-    embed  = item_to_embed(item_data, prices)
-    await interaction.followup.send(embed=embed)
-
-
-@item_search.autocomplete("name")
-async def item_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    if not item_cache_ready or len(current) < 2:
-        return []
-
-    matches = search_items(current, limit=25)
-    return [
-        app_commands.Choice(name=item["name"][:100], value=f"{item['name']}|{item['id']}")
-        for item in matches
-    ]
 
 # ---------------------------------------------------------------------------
 # helpers shared by unlink commands
@@ -2093,6 +2972,27 @@ async def viewsetup(interaction: discord.Interaction):
             inline=False,
         )
 
+    # ── LFG ──────────────────────────────────────────────────────────────
+    lfg_board = get_lfg_board(guild_id)
+    if lfg_board:
+        lfg_channel  = interaction.guild.get_channel(lfg_board.get("channel_id", 0))
+        lfg_announce = interaction.guild.get_channel(lfg_board.get("announce_channel_id", 0))
+        embed.add_field(
+            name="📅 LFG",
+            value=(
+                f"**Calendar channel:** {lfg_channel.mention if lfg_channel else '⚠️ Channel not found'}\n"
+                f"**Announce channel:** {lfg_announce.mention if lfg_announce else '⚠️ Channel not found'}\n"
+                f"**Active LFGs:** {len(get_guild_lfgs(guild_id))}"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="📅 LFG",
+            value="Not configured. Run `/setuplfg` to enable.",
+            inline=False,
+        )
+
     # ── Auto-delete channels ─────────────────────────────────────────────
     if ad_ids:
         lines = []
@@ -2235,6 +3135,8 @@ async def roster_loop():
             members = await post_or_edit_roster(channel, cfg, guild_id)
             if discord_guild and members:
                 await sync_verifications(discord_guild, cfg, members)
+            if discord_guild:
+                await sync_leadership_roles(discord_guild)
         except aiohttp.ClientResponseError as e:
             if e.status == 403:
                 logging.error(
@@ -2268,6 +3170,16 @@ async def roster_loop():
                 await update_giveaway(int(guild_id_str), giveaway_name, giveaway)
             except Exception as e:
                 logging.error(f"Failed to update giveaway '{giveaway_name}' in guild {guild_id_str}: {e}")
+
+
+@tasks.loop(seconds=30)
+async def lfg_loop():
+    await process_due_lfgs()
+
+
+@lfg_loop.before_loop
+async def before_lfg_loop():
+    await bot.wait_until_ready()
 
 
 # ---------------------------------------------------------------------------
@@ -2470,6 +3382,147 @@ async def removegiveaway(interaction: discord.Interaction, name: str):
         ephemeral=True
     )
     logging.info(f"Admin {interaction.user.id} deleted giveaway '{name}' in guild {interaction.guild_id}")
+
+
+# ---------------------------------------------------------------------------
+# /setuplfg
+# ---------------------------------------------------------------------------
+
+@tree.command(name="setuplfg", description="[Admin] Set up the LFG button and calendar.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    channel          = "Channel where the Create LFG button and the LFG calendar will be posted",
+    announce_channel = "Channel where 'starting now' pings are posted",
+)
+async def setuplfg(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    announce_channel: discord.TextChannel,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send("❌ This command can only be used in a server.", ephemeral=True)
+        return
+
+    me = guild.me
+    problems = []
+    perms = channel.permissions_for(me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        problems.append(f"• {channel.mention}: I need **View Channel**, **Send Messages** and **Embed Links**.")
+    aperms = announce_channel.permissions_for(me)
+    if not (aperms.view_channel and aperms.send_messages):
+        problems.append(f"• {announce_channel.mention}: I need **View Channel** and **Send Messages**.")
+    if problems:
+        await interaction.followup.send(
+            "❌ I'm missing permissions:\n" + "\n".join(problems), ephemeral=True
+        )
+        return
+
+    # Re-running /setuplfg moves the button + calendar; active LFGs are kept.
+    old = get_lfg_board(guild.id)
+    if old:
+        old_channel = guild.get_channel(old.get("channel_id", 0))
+        if old_channel:
+            for key in ("button_message_id", "board_message_id"):
+                message_id = old.get(key)
+                if not message_id:
+                    continue
+                try:
+                    await old_channel.get_partial_message(message_id).delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+    entries = sorted_lfg_entries(guild.id)
+    intro = discord.Embed(
+        title="🗓️ Looking for Group",
+        description=(
+            "Click **Create LFG** to schedule a group.\n"
+            "Every upcoming LFG is listed in the calendar below. Pick one from the dropdown "
+            "to see who's in and join with your role."
+        ),
+        color=0x5865F2,
+    )
+    try:
+        button_msg = await channel.send(embed=intro, view=LfgCreateView())
+        board_msg  = await channel.send(
+            embed=build_lfg_board_embed(entries),
+            view=LfgBoardView(entries) if entries else None,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            f"❌ I don't have permission to post in {channel.mention}.", ephemeral=True
+        )
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ Failed to post in {channel.mention}: {e}", ephemeral=True)
+        return
+
+    set_lfg_board(guild.id, {
+        "channel_id":          channel.id,
+        "announce_channel_id": announce_channel.id,
+        "button_message_id":   button_msg.id,
+        "board_message_id":    board_msg.id,
+        "setup_by":            interaction.user.id,
+    })
+
+    note = ""
+    if channel.permissions_for(guild.default_role).send_messages:
+        note = (
+            f"\n⚠️ Everyone can currently send messages in {channel.mention}, so chat will push the "
+            f"button and calendar up. Consider denying **Send Messages** for @everyone there."
+        )
+    await interaction.followup.send(
+        f"✅ LFG set up. The button and calendar are in {channel.mention}; "
+        f"'starting now' pings go to {announce_channel.mention}.{note}",
+        ephemeral=True,
+    )
+    logging.info(f"Admin {interaction.user.id} set up LFG in guild {guild.id}")
+
+
+# ---------------------------------------------------------------------------
+# /removelfg
+# ---------------------------------------------------------------------------
+
+@tree.command(name="removelfg", description="[Admin] Remove the LFG button and calendar, and delete all active LFGs.")
+@app_commands.default_permissions(administrator=True)
+async def removelfg(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    board    = get_lfg_board(guild_id)
+    active   = get_guild_lfgs(guild_id)
+    if not board and not active:
+        await interaction.followup.send("The LFG system is not set up for this server.", ephemeral=True)
+        return
+
+    # Hold the calendar lock so an in-flight refresh can't repost the message we're deleting.
+    async with _lfg_board_locks.setdefault(guild_id, asyncio.Lock()):
+        async with get_lfg_lock():
+            config = load_config()
+            config.get("lfg_boards", {}).pop(str(guild_id), None)
+            config.get("lfgs", {}).pop(str(guild_id), None)
+            save_config(config)
+
+        if board:
+            channel = interaction.guild.get_channel(board.get("channel_id", 0))
+            if channel:
+                for key in ("button_message_id", "board_message_id"):
+                    message_id = board.get(key)
+                    if not message_id:
+                        continue
+                    try:
+                        await channel.get_partial_message(message_id).delete()
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+    logging.info(f"Admin {interaction.user.id} removed the LFG system in guild {guild_id} ({len(active)} active LFG(s) deleted)")
+    await interaction.followup.send(
+        f"✅ LFG system removed: the button and calendar are deleted"
+        + (f", along with {len(active)} active LFG{'s' if len(active) != 1 else ''}." if active else "."),
+        ephemeral=True,
+    )
 
 
 bot.run(DISCORD_TOKEN)
