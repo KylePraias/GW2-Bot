@@ -1373,7 +1373,7 @@ class LfgRolesView(discord.ui.View):
     async def standard_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._post(interaction, standard=True)
 
-    @discord.ui.button(label="DPS only", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Any role", style=discord.ButtonStyle.secondary)
     async def dps_only(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._post(interaction, standard=False)
 
