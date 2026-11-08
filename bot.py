@@ -1245,7 +1245,7 @@ class LfgSizeView(discord.ui.View):
         content = (
             f"Party size: **{max_slots}**.\n"
             "Use standard squad roles (`dps`, `qdps`, `adps`, `qheal`, `aheal`, `flex`), "
-            "or DPS only?"
+            "or any roles?"
         )
         if edit:
             await interaction.response.edit_message(content=content, view=view)
