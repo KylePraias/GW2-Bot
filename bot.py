@@ -8,6 +8,7 @@ import os
 import io
 import logging
 import secrets
+import random
 from datetime import datetime, timedelta, timezone, time as dt_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2081,6 +2082,19 @@ async def _announce_channel_for(guild_id: int):
     return channel
 
 
+# Friendly "new LFG" announcements; one is picked at random each time.
+# Placeholders: {ping} = @lfg role, {host} = creator mention, {name} = activity name.
+LFG_CREATED_MESSAGES = [
+    "{ping} Commander {host} is rallying a squad for **{name}**. Grab your gear and head to the calendar.",
+    "{ping} {host} is putting together a party for **{name}**. Tyria won't save itself, so come along.",
+    "{ping} A new squad is forming. {host} is leading **{name}**, so pick your role and sign up.",
+    "{ping} {host} is looking for fellow adventurers for **{name}**. Sign up and join the fun.",
+    "{ping} **{name}** has been posted by {host}. Bring your best build and claim a spot.",
+    "{ping} Another day, another Elder Dragon. {host} is hosting **{name}**, and there's room for you.",
+    "{ping} {host} is calling the guild together for **{name}**. Sign up on the calendar and we'll see you in Tyria.",
+]
+
+
 async def announce_lfg_created(guild: discord.Guild, lfg: dict):
     """Post a short 'new LFG' announcement in the announcement channel chosen in /setuplfg."""
     channel = await _announce_channel_for(guild.id)
@@ -2097,7 +2111,11 @@ async def announce_lfg_created(guild: discord.Guild, lfg: dict):
     )
     try:
         await channel.send(
-            f"{ping} <@{lfg['host_id']}> created a new LFG: **{lfg['name']}**",
+            random.choice(LFG_CREATED_MESSAGES).format(
+                ping=ping,
+                host=f"<@{lfg['host_id']}>",
+                name=lfg["name"],
+            ),
             allowed_mentions=mentions,
         )
     except (discord.Forbidden, discord.HTTPException) as e:
