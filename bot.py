@@ -376,7 +376,7 @@ def delete_giveaway(guild_id: int, name: str):
 # Stored as top-level keys in config.json:
 # { "lfg_boards": { "<discord_guild_id>": {
 #       "channel_id": int,            # channel holding the button + calendar
-#       "announce_channel_id": int,   # "starting now" pings
+#       "announce_channel_id": int,   # "new LFG" and "starting now" pings
 #       "button_message_id": int,
 #       "board_message_id": int,
 #       "setup_by": int
@@ -1364,6 +1364,7 @@ class LfgRolesView(discord.ui.View):
         await interaction.edit_original_response(
             content=f"✅ **{self.name}** is on the calendar in <#{board['channel_id']}>."
         )
+        await announce_lfg_created(interaction.guild, lfg)
         logging.info(
             f"User {interaction.user.id} created LFG '{self.name}' (id {lfg_id}, "
             f"{self.max_slots} slots, roles={roles}) in guild {guild_id}"
@@ -2078,6 +2079,29 @@ async def _announce_channel_for(guild_id: int):
         logging.warning(f"LFG announce channel {board['announce_channel_id']} not found in guild {guild_id}; using calendar channel")
         channel = await _get_channel(board["channel_id"])
     return channel
+
+
+async def announce_lfg_created(guild: discord.Guild, lfg: dict):
+    """Post a short 'new LFG' announcement in the announcement channel chosen in /setuplfg."""
+    channel = await _announce_channel_for(guild.id)
+    if channel is None:
+        logging.warning(f"LFG '{lfg.get('name')}' created in guild {guild.id} but no channel to announce in")
+        return
+
+    lfg_role = discord.utils.find(lambda r: r.name.lower() == "lfg", guild.roles)
+    ping = lfg_role.mention if lfg_role else "@lfg"
+    mentions = discord.AllowedMentions(
+        roles=[lfg_role] if lfg_role else False,
+        users=True,
+        everyone=False,
+    )
+    try:
+        await channel.send(
+            f"{ping} <@{lfg['host_id']}> created a new LFG: **{lfg['name']}**",
+            allowed_mentions=mentions,
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        logging.warning(f"Could not send LFG created message for '{lfg.get('name')}': {e}")
 
 
 async def announce_lfg_start(guild_id: int, lfg: dict):
@@ -3392,7 +3416,7 @@ async def removegiveaway(interaction: discord.Interaction, name: str):
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     channel          = "Channel where the Create LFG button and the LFG calendar will be posted",
-    announce_channel = "Channel where 'starting now' pings are posted",
+    announce_channel = "Channel where new LFG and 'starting now' pings are posted",
 )
 async def setuplfg(
     interaction: discord.Interaction,
